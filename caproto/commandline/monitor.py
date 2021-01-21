@@ -11,15 +11,15 @@ For access to the underlying functionality from a Python script or interactive
 Python session, do not import this module; instead import caproto.sync.client.
 """
 import argparse
-from datetime import datetime
-import functools
 import time
-from ..sync.client import subscribe, block
-from .. import SubscriptionType, set_handler, __version__
+from datetime import datetime
+
+from .. import SubscriptionType, __version__, set_handler
 from .._log import _set_handler_with_logger
 from .._utils import ShowVersionAction
-from .cli_print_formats import (format_response_data, gen_data_format,
-                                clean_format_args, format_str_adjust)
+from ..sync.client import block, subscribe
+from .cli_print_formats import (clean_format_args, format_response_data,
+                                format_str_adjust, gen_data_format)
 
 
 def main():
@@ -59,6 +59,10 @@ def main():
     parser.add_argument('-n', action='store_true',
                         help=("Retrieve enums as integers (default is "
                               "strings)."))
+    parser.add_argument('-S', dest="array_as_str", action='store_true',
+                        help=("Print array of char as a string (long string)"))
+    parser.add_argument('-#', dest="data_count", type=int, metavar="COUNT",
+                        help=("Print first COUNT elements of an array"))
     parser.add_argument('--no-color', action='store_true',
                         help="Suppress ANSI color codes in log messages.")
     parser.add_argument('--no-repeater', action='store_true',
@@ -137,8 +141,9 @@ def main():
     history = []
     tokens = {'callback_count': 0}
 
-    def callback(pv_name, response):
+    def callback(sub, response):
         tokens['callback_count'] += 1
+        pv_name = sub.pv_name
 
         data_fmt = gen_data_format(args=args, data=response.data)
 
@@ -184,10 +189,10 @@ def main():
         for pv_name in args.pv_names:
             sub = subscribe(pv_name,
                             mask=mask,
+                            data_count=args.data_count,
                             priority=args.priority)
-            cb = functools.partial(callback, pv_name)
-            sub.add_callback(cb)
-            cbs.append(cb)  # Hold ref to keep cb from being garbage collected.
+            sub.add_callback(callback)
+            cbs.append(callback)  # Hold ref to keep it from being garbage collected.
             subs.append(sub)
         # Wait to be interrupted by KeyboardInterrupt.
         block(*subs, duration=args.duration, timeout=args.timeout,

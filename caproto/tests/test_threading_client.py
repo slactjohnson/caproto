@@ -3,19 +3,20 @@
 
 import collections
 import functools
+import getpass
+import socket
+import threading
+import time
+
+import pytest
+
 import caproto
+import caproto as ca
 import caproto._utils
 import caproto.threading.client
-import time
-import socket
-import getpass
-import threading
-
-from caproto.threading.client import (Context, SharedBroadcaster, Batch,
-                                      ContextDisconnectedError)
 from caproto import ChannelType
-import caproto as ca
-import pytest
+from caproto.threading.client import (Batch, Context, ContextDisconnectedError,
+                                      SharedBroadcaster)
 
 from .conftest import default_setup_module as setup_module  # noqa
 from .conftest import default_teardown_module as teardown_module  # noqa
@@ -94,7 +95,7 @@ def test_specified_port(monkeypatch, context, ioc):
     address_list = list(caproto.get_address_list())
     address_list.append('{}:{}'.format(circuit.host, circuit.port))
 
-    def get_address_list():
+    def get_address_list(*, protocol='CA'):
         return address_list
 
     for module in (caproto._utils, caproto, caproto.threading.client):
@@ -167,7 +168,7 @@ def test_server_crash(context, ioc_factory):
     # Add a user callback so that the subscription takes effect.
     collector = []
 
-    def collect(item):
+    def collect(sub, item):
         collector.append(item)
     sub.add_callback(collect)
 
@@ -205,7 +206,7 @@ def test_subscriptions(ioc, context):
 
     monitor_values = []
 
-    def callback(command, **kwargs):
+    def callback(sub, command, **kwargs):
         assert isinstance(command, ca.EventAddResponse)
         monitor_values.append(command.data[0])
 
@@ -219,7 +220,81 @@ def test_subscriptions(ioc, context):
     sub.clear()
     pv.write((4, ), wait=True)  # This update should not be received by us.
 
-    for i in range(3):
+    for _ in range(3):
+        if pv.read().data[0] == 3:
+            time.sleep(0.2)
+            break
+        else:
+            time.sleep(0.2)
+
+    assert monitor_values[1:] == [1, 2, 3]
+
+
+def test_deprecated_callback_signature(ioc, context):
+    cntx = context
+
+    pv, = cntx.get_pvs(ioc.pvs['int'])
+    pv.wait_for_connection(timeout=10)
+
+    monitor_values = []
+
+    def callback(command):
+        "Old-style signature (missing pv argument)"
+        assert isinstance(command, ca.EventAddResponse)
+        monitor_values.append(command.data[0])
+
+    sub = pv.subscribe()
+    # Subscribing should warn about the deprecated signature...
+    with pytest.warns(UserWarning):
+        sub.add_callback(callback)
+
+    # ...but it should work just the same.
+    time.sleep(0.2)  # Wait for EventAddRequest to be sent and processed.
+    pv.write((1, ), wait=True)
+    pv.write((2, ), wait=True)
+    pv.write((3, ), wait=True)
+    time.sleep(0.2)  # Wait for the last update to be processed.
+    sub.clear()
+    pv.write((4, ), wait=True)  # This update should not be received by us.
+
+    for _ in range(3):
+        if pv.read().data[0] == 3:
+            time.sleep(0.2)
+            break
+        else:
+            time.sleep(0.2)
+
+    assert monitor_values[1:] == [1, 2, 3]
+
+
+def test_another_deprecated_callback_signature(ioc, context):
+    cntx = context
+
+    pv, = cntx.get_pvs(ioc.pvs['int'])
+    pv.wait_for_connection(timeout=10)
+
+    monitor_values = []
+
+    def callback(command, **kwargs):
+        "Old-style signature (missing pv argument) with optional kwargs"
+        assert isinstance(command, ca.EventAddResponse)
+        monitor_values.append(command.data[0])
+
+    sub = pv.subscribe()
+    # Subscribing should warn about the deprecated signature...
+    with pytest.warns(UserWarning):
+        sub.add_callback(callback)
+
+    # ...but it should work just the same.
+    time.sleep(0.2)  # Wait for EventAddRequest to be sent and processed.
+    pv.write((1, ), wait=True)
+    pv.write((2, ), wait=True)
+    pv.write((3, ), wait=True)
+    time.sleep(0.2)  # Wait for the last update to be processed.
+    sub.clear()
+    pv.write((4, ), wait=True)  # This update should not be received by us.
+
+    for _ in range(3):
         if pv.read().data[0] == 3:
             time.sleep(0.2)
             break
@@ -281,11 +356,10 @@ def test_multiple_subscriptions_one_server(ioc, context):
         collector[sub].append(response)
 
     subs = [pv.subscribe() for pv in pvs]
-    cbs = {sub: functools.partial(collect, sub) for sub in subs}
-    for sub, cb in cbs.items():
-        sub.add_callback(cb)
+    for sub in subs:
+        sub.add_callback(collect)
     time.sleep(0.2)
-    for sub, responses in collector.items():
+    for responses in collector.values():
         assert len(responses) == 1
     assert len(pv.circuit_manager.subscriptions) == len(pvs) > 1
 
@@ -304,7 +378,7 @@ def test_subscription_objects_are_reused(ioc, context):
     # Attach a callback so that these subs are activated and enter the
     # Context's cache.
 
-    def f(item):
+    def f(sub, item):
         ...
 
     sub.add_callback(f)
@@ -323,7 +397,7 @@ def test_unsubscribe_all(ioc, context):
 
     collector = []
 
-    def f(response):
+    def f(sub, response):
         collector.append(response)
 
     sub0.add_callback(f)
@@ -502,7 +576,7 @@ def test_multithreaded_many_write(ioc, context, thread_count,
     pv, = context.get_pvs(ioc.pvs['int'])
     values = []
 
-    def callback(command):
+    def callback(sub, command):
         values.append(command.data.tolist()[0])
 
     sub = pv.subscribe()
@@ -535,14 +609,14 @@ def test_multithreaded_many_subscribe(ioc, context, thread_count,
 
         values[thread_id] = []
 
-        def callback(command):
+        def callback(sub, command):
             print(thread_id, command)
             values[thread_id].append(command.data.tolist()[0])
 
         sub = pv.subscribe()
         sub.add_callback(callback)
         # Wait <= 20 seconds until first EventAddResponse is received.
-        for i in range(200):
+        for _ in range(200):
             if values[thread_id]:
                 break
             time.sleep(0.1)
@@ -553,7 +627,7 @@ def test_multithreaded_many_subscribe(ioc, context, thread_count,
         # Everybody here? On my signal... SEND UPDATES!! Ahahahahaha!
         # Destruction!!
         # Wait <= 20 seconds until three more EventAddResponses are received.
-        for i in range(200):
+        for _ in range(200):
             if len(values[thread_id]) == 4:
                 break
             time.sleep(0.1)
@@ -580,9 +654,9 @@ def test_multithreaded_many_subscribe(ioc, context, thread_count,
         results = _multithreaded_exec(_test, thread_count + 1)
     except threading.BrokenBarrierError:
         if init_barrier.broken:
-            print(f'Init barrier broken!')
+            print('Init barrier broken!')
         if sub_ended_barrier.broken:
-            print(f'Sub_ended barrier broken!')
+            print('Sub_ended barrier broken!')
         raise
 
     for value_list in results:
@@ -652,7 +726,7 @@ def test_events_off_and_on(ioc, context):
 
     monitor_values = []
 
-    def callback(command, **kwargs):
+    def callback(sub, command, **kwargs):
         assert isinstance(command, ca.EventAddResponse)
         monitor_values.append(command.data[0])
 
@@ -664,7 +738,7 @@ def test_events_off_and_on(ioc, context):
     pv.write((3, ), wait=True)
     time.sleep(0.2)  # Wait for the last update to be processed.
 
-    for i in range(3):
+    for _ in range(3):
         if pv.read().data[0] == 3:
             time.sleep(0.2)
             break
@@ -687,7 +761,7 @@ def test_events_off_and_on(ioc, context):
     pv.write((8, ), wait=True)
     pv.write((9, ), wait=True)
 
-    for i in range(3):
+    for _ in range(3):
         if pv.read().data[0] == 7:
             time.sleep(0.2)
             break
@@ -695,6 +769,21 @@ def test_events_off_and_on(ioc, context):
             time.sleep(0.2)
 
     assert monitor_values[1:] == [1, 2, 3, 6, 7, 8, 9]
+
+
+def test_registration_of_connection_state_callback(context, ioc):
+    # Check for bug caught in https://github.com/caproto/caproto/issues/607
+    # wherein callback was registered twice.
+
+    def cb(pv, state):
+        ...
+
+    pv, = context.get_pvs(
+        ioc.pvs['str'],
+        connection_state_callback=cb,
+        access_rights_callback=cb)
+    assert len(pv.connection_state_callback.callbacks) == 1
+    assert len(pv.access_rights_callback.callbacks) == 1
 
 
 def test_time_since_last_heard(context, ioc):

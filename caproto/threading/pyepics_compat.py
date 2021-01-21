@@ -219,10 +219,10 @@ class PV:
 
         if isinstance(callback, (tuple, list)):
             for i, thiscb in enumerate(callback):
-                if hasattr(thiscb, '__call__'):
+                if callable(thiscb):
                     self.callbacks[i] = (thiscb, {})
 
-        elif hasattr(callback, '__call__'):
+        elif callable(callback):
             self.callbacks[0] = (callback, {})
 
         self._caproto_pv, = self._context.get_pvs(
@@ -596,7 +596,7 @@ class PV:
             except Exception:
                 ...
 
-    def __on_changes(self, command):
+    def __on_changes(self, sub, command):
         """internal callback function: do not overwrite!!
         To have user-defined code run when the PV value changes,
         use add_callback()
@@ -635,7 +635,7 @@ class PV:
         kwd = copy.copy(self._args)
         kwd.update(kwargs)
         kwd['cb_info'] = (index, self)
-        if hasattr(fcn, '__call__'):
+        if callable(fcn):
             fcn(**kwd)
 
     def add_callback(self, callback, *, index=None, run_now=False,

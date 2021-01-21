@@ -1,31 +1,31 @@
-'''
+"""
 caproto IOC "high-level" server framework
 
 This does not define any wire protocol information or have anything specific to
 a single asyncio library.
 
 For an example server implementation, see caproto.curio.server
-'''
+"""
 import argparse
 import copy
+import enum
 import inspect
 import logging
 import sys
 import time
-
-from collections import (namedtuple, OrderedDict, defaultdict)
+import warnings
+from collections import OrderedDict, defaultdict, namedtuple
 from types import MethodType
 
-from .. import (ChannelDouble, ChannelShort, ChannelInteger, ChannelString,
-                ChannelEnum, ChannelType, ChannelChar, ChannelByte,
-                ChannelAlarm,
-                AccessRights, get_server_address_list,
-                AlarmStatus, AlarmSeverity, CaprotoRuntimeError,
-                CaprotoValueError, CaprotoTypeError, CaprotoAttributeError,
-                __version__)
-from .._backend import backend
-from caproto._log import set_handler, _set_handler_with_logger
+from caproto._log import _set_handler_with_logger, set_handler
 
+from .. import (AccessRights, AlarmSeverity, AlarmStatus,
+                CaprotoAttributeError, CaprotoRuntimeError, CaprotoTypeError,
+                CaprotoValueError, ChannelAlarm, ChannelByte, ChannelChar,
+                ChannelDouble, ChannelEnum, ChannelFloat, ChannelInteger,
+                ChannelShort, ChannelString, ChannelType, __version__,
+                get_server_address_list)
+from .._backend import backend
 
 module_logger = logging.getLogger(__name__)
 
@@ -39,6 +39,7 @@ __all__ = ['AsyncLibraryLayer',
            'PvpropertyByte', 'PvpropertyByteRO',
            'PvpropertyChar', 'PvpropertyCharRO',
            'PvpropertyDouble', 'PvpropertyDoubleRO',
+           'PvpropertyFloat', 'PvpropertyFloatRO',
            'PvpropertyBoolEnum', 'PvpropertyBoolEnumRO',
            'PvpropertyEnum', 'PvpropertyEnumRO',
            'PvpropertyInteger', 'PvpropertyIntegerRO',
@@ -48,21 +49,72 @@ __all__ = ['AsyncLibraryLayer',
            ]
 
 
+def _enum_instance_to_enum_strings(enum_class):
+    """
+    Get enum strings list from an `enum.IntEnum`-based class.
+
+    Parameters
+    ----------
+    enum_class : subclass of enum.IntEnum
+    """
+
+    def get_enum_string(int_value):
+        try:
+            return enum_class(int_value).name
+        except ValueError:
+            return f'unset_{int_value}'
+
+    return [
+        get_enum_string(idx)
+        for idx in range(max(enum_class) + 1)
+    ]
+
+
 class AsyncLibraryLayer:
-    '''Library compatibility layer
+    """
+    Library compatibility layer
 
     To be subclassed/customized by async library layer for compatibility Then,
     a single IOC written within the high-level server framework can potentially
     use the same code base and still be run on either curio or trio, etc.
-    '''
+    """
     name = None
     ThreadsafeQueue = None
     library = None
 
 
 class PvpropertyData:
+    """
+    A top-level class for mixing in with `ChannelData` subclasses.
+
+    Takes in a fully-expanded `pvname`, `PVSpec`, and `group` instance.
+
+    Parameters
+    ----------
+    pvname : str
+        The fully expanded process variable name.
+
+    group : PVGroup
+        The PVGroup instance to which this pvproperty belongs.
+
+    pvspec : PVSpec
+        The associated `PVSpec` instance, containing detailed information
+        about the pvproperty.
+
+    doc : str, optional
+        Docstring / documentation information.
+
+    record : str, optional
+        The record type to report over channel access.  This can be queried
+        by way of ``caproto-get record.RTYP`` or
+        ``caproto-get -d 38 --format "{response.metadata.value}" record``
+
+    **kwargs :
+        Passed to the superclass, along with reported_record_type.
+    """
+
     def __init__(self, *, pvname, group, pvspec, doc=None, mock_record=None,
-                 logger=None, **kwargs):
+                 record=None, logger=None, **kwargs):
         self.pvname = pvname  # the full, expanded PV name
         self.name = f'{group.name}.{pvspec.attr}'
         self.group = group
@@ -88,22 +140,42 @@ class PvpropertyData:
         if doc is not None:
             self.__doc__ = doc
 
-        self.record_type = mock_record
+        self.record_type = record or mock_record
 
-        super().__init__(**kwargs)
+        # This should not be allowed to be different from record_type
+        kwargs.pop('reported_record_type', None)
+
+        super().__init__(reported_record_type=self.record_type or 'caproto',
+                         **kwargs)
 
         if mock_record is not None:
-            from .records import records
-            field_class = records[mock_record]
-            if self.pvspec.fields is not None:
-                new_dict = dict(field_class.__dict__)
-                for (field, field_attr), func in self.pvspec.fields:
-                    prop = new_dict[field]
-                    prop.pvspec = prop.pvspec._replace(**{field_attr: func})
+            if record is not None:
+                raise ValueError(
+                    'Cannot specify both `mock_record` and `record`; '
+                    'please use only `record`')
+            warnings.warn(
+                '`mock_record` is deprecated. Use `pvproperty(record=)`')
 
+        if self.record_type is not None:
+            from .records import records
+            field_class = records[self.record_type]
+            if self.pvspec.fields is not None:
+                clsdict = {}
+                # Update all fields with user-customized putters
+                for (prop_name, field_attr), func in self.pvspec.fields:
+                    try:
+                        prop = clsdict[prop_name]
+                    except KeyError:
+                        prop = copy.copy(getattr(field_class, prop_name))
+
+                    prop.pvspec = prop.pvspec._replace(**{field_attr: func})
+                    clsdict[prop_name] = prop
+
+                # Subclass the original record fields, patching in our new
+                # methods:
                 field_class = type(
                     field_class.__name__ + self.name.replace('.', '_'),
-                    (field_class, ), new_dict)
+                    (field_class, ), clsdict)
 
             self.field_inst = field_class(
                 prefix='', parent=self,
@@ -115,6 +187,21 @@ class PvpropertyData:
             self.fields = {}
 
     async def read(self, data_type):
+        """
+        The top-level read method, with a specific requested data type.
+
+        This calls the getter (if defined, falling back to
+        `PVGroup.group_read`).  If the getter returns a value, it will be
+        written back to update the internal state and update any subscriptions.
+
+        Finally, the internal value is converted to the requested data type
+        and returned.
+
+        Parameters
+        ----------
+        data_type : ChannelType
+            The type of data to return.
+        """
         value = await self.getter(self)
         if value is not None:
             if self.pvspec.get is None:
@@ -127,20 +214,48 @@ class PvpropertyData:
         return await self._read(data_type)
 
     async def verify_value(self, value):
+        """
+        The top-level dbr-facing "write" method.
+
+        The value will first be validated by `ChannelData.verify_value`,
+        and then passed along to the user-specified `pvproperty.putter`,
+        falling back to `PVGroup.group_write`.
+
+        Parameters
+        ----------
+        value : any
+            The value to write.
+        """
         value = await super().verify_value(value)
-        if self.pvspec.put is None:
-            self.log.debug('group verify value for %s: %r', self.name, value)
-        else:
-            self.log.debug('verify value for %s: %r', self.name, value)
         return await self.putter(self, value)
 
     async def _server_startup(self, async_lib):
+        """A per-pvproperty startup hook; enabled at __init__ time."""
         return await self.startup(self, async_lib)
 
     async def _server_shutdown(self, async_lib):
+        """A per-pvproperty shutdown hook; enabled at __init__ time."""
         return await self.shutdown(self, async_lib)
 
     def get_field(self, field):
+        """
+        Get a field by name.
+
+        Parameters
+        ----------
+        field : str
+            The field name.
+
+        Returns
+        -------
+        ChannelData
+            The field instance.
+
+        Raises
+        ------
+        KeyError
+            If the field is invalid.
+        """
         if not field or field == 'VAL':
             return self
         return self.fields[field]
@@ -162,6 +277,10 @@ class PvpropertyInteger(PvpropertyData, ChannelInteger):
     ...
 
 
+class PvpropertyFloat(PvpropertyData, ChannelFloat):
+    ...
+
+
 class PvpropertyDouble(PvpropertyData, ChannelDouble):
     ...
 
@@ -171,7 +290,17 @@ class PvpropertyString(PvpropertyData, ChannelString):
 
 
 class PvpropertyEnum(PvpropertyData, ChannelEnum):
-    ...
+    def __init__(self, *, enum_strings=None, value=None, **kwargs):
+        if isinstance(value, enum.IntEnum):
+            if enum_strings is not None:
+                raise CaprotoValueError(
+                    'Cannot specify both an enum `value` and `enum_strings`')
+
+            enum_strings = _enum_instance_to_enum_strings(type(value))
+            value = value.name
+
+        super().__init__(enum_strings=enum_strings, value=value,
+                         **kwargs)
 
 
 class PvpropertyBoolEnum(PvpropertyData, ChannelEnum):
@@ -182,6 +311,10 @@ class PvpropertyBoolEnum(PvpropertyData, ChannelEnum):
 
 
 class PvpropertyReadOnlyData(PvpropertyData):
+    """
+    A mixin class which marks this data as read-only from channel access.
+    """
+
     def check_access(self, host, user):
         return AccessRights.READ
 
@@ -206,12 +339,26 @@ class PvpropertyDoubleRO(PvpropertyReadOnlyData, ChannelDouble):
     ...
 
 
+class PvpropertyFloatRO(PvpropertyReadOnlyData, ChannelFloat):
+    ...
+
+
 class PvpropertyStringRO(PvpropertyReadOnlyData, ChannelString):
     ...
 
 
 class PvpropertyEnumRO(PvpropertyReadOnlyData, ChannelEnum):
-    ...
+    def __init__(self, *, enum_strings=None, value=None, **kwargs):
+        if isinstance(value, enum.IntEnum):
+            if enum_strings is not None:
+                raise CaprotoValueError(
+                    'Cannot specify both an enum `value` and `enum_strings`')
+
+            enum_strings = _enum_instance_to_enum_strings(type(value))
+            value = value.name
+
+        super().__init__(enum_strings=enum_strings, value=value,
+                         **kwargs)
 
 
 class PvpropertyBoolEnumRO(PvpropertyReadOnlyData, ChannelEnum):
@@ -225,7 +372,11 @@ class PVSpec(namedtuple('PVSpec',
                         'get put startup shutdown attr name dtype value '
                         'max_length alarm_group read_only doc fields '
                         'cls_kwargs')):
-    '''PV information specification
+    """
+    PV information specification.
+
+    This is an immutable tuple that contains everything needed to generate
+    a `ChannelData` instance from a `pvproperty`.
 
     Parameters
     ----------
@@ -259,7 +410,7 @@ class PVSpec(namedtuple('PVSpec',
         Specification for record fields
     cls_kwargs : dict, optional
         Keyword arguments for the ChannelData-based class
-    '''
+    """
     __slots__ = ()
     default_dtype = int
 
@@ -329,7 +480,17 @@ class PVSpec(namedtuple('PVSpec',
 
 
 class FieldProxy:
-    'pvproperty.fields.Field'
+    """
+    A proxy class which allows access to ``pvproperty.fields.Field``.
+
+    This allows for customization of the putter and startup methods, for
+    example, in a top-level `PVGroup`.
+
+    Note
+    ----
+    This class is primarily for internal use only.
+    """
+
     def __init__(self, field_spec, record_class, field_name):
         self.field_spec = field_spec
         self.record_class = record_class
@@ -353,15 +514,25 @@ class FieldProxy:
 
 
 class FieldSpec:
-    '''A field specification for a pvproperty record
+    """
+    A field specification for a pvproperty record.
 
-    Doubles as the .fields attribute of a pvproperty
-    '''
+    This is used in the ``.fields`` attribute of a pvproperty, proxying
+    fields for customization by way of `FieldProxy`.
+
+    Note
+    ----
+    This class is primarily for internal use only.
+    """
 
     def __init__(self, prop, *, record_type=None):
         self.prop = prop
         self._record_type = record_type
         self._fields = {}
+
+    @property
+    def record_type(self):
+        return self._record_type
 
     def __getattr__(self, attr):
         from .records import RecordFieldGroup, records
@@ -392,39 +563,64 @@ class FieldSpec:
 
 
 class pvproperty:
-    '''A property-like descriptor for specifying a PV in a group
+    """
+    A property-like descriptor for specifying a PV in a `PVGroup`.
 
     Parameters
     ----------
     get : async callable, optional
         Called when PV is read through channel access
+
     put : async callable, optional
         Called when PV is written to through channel access
+
     startup : async callable, optional
         Called at start of server; a hook for initialization and background
         processing
+
     shutdown : async callable, optional
         Called at shutdown of server; a hook for cleanup
+
     name : str, optional
         The PV name (defaults to the attribute name of the pvproperty)
+
     dtype : ChannelType or builtin type, optional
         The data type
+
     value : any, optional
         The initial value
+
     max_length : int, optional
         The maximum possible length acceptable for the data
         By default, this is `len(value) or 1`
+
     alarm_group : str, optional
         The alarm group the PV should be attached to
+
     read_only : bool, optional
         Read-only PV over channel access
+
     doc : str, optional
         Docstring associated with the property
+
     fields : FieldSpec, optional
         Specification for record fields
+
     **cls_kwargs :
         Keyword arguments for the ChannelData-based class
-    '''
+
+    Attributes
+    ----------
+    pvspec : PVSpec
+        The information from `__init__` is aggregated into a single, immutable
+        `PVSpec` instance.
+
+    record_type : str
+        The reported record type name.
+
+    field_spec : FieldSpec
+        The field specification information helper.
+    """
 
     def __init__(self, get=None, put=None, startup=None, shutdown=None, *,
                  name=None, dtype=None, value=None, max_length=None,
@@ -435,40 +631,54 @@ class pvproperty:
         if doc is None and get is not None:
             doc = get.__doc__
 
-        if field_spec is None:
-            if name is None or '.' not in name:
-                field_spec = FieldSpec(
-                    self,
-                    record_type=cls_kwargs.get('mock_record'))
+        self.record_type = self._record_type_from_kwargs(cls_kwargs)
+
+        if field_spec is not None:
+            if name and '.' in name:
+                raise ValueError(f'Cannot specify field_spec if '
+                                 f'the PV name has a "." in it: {name!r}')
+            if self.record_type:
+                raise ValueError(
+                    'Cannot specify both field_spec and record; the record '
+                    'type from field_spec must be used')
+            self.record_type = field_spec.record_type
+        elif self.record_type:
+            if name and '.' in name:
+                raise ValueError(f'Cannot specify a record if '
+                                 f'the PV name has a "." in it: {name!r}')
+            field_spec = FieldSpec(self, record_type=self.record_type)
+
         self.field_spec = field_spec
-
-        fields = (None if field_spec is None
-                  else field_spec.fields)
-
-        self.pvspec = PVSpec(get=get, put=put, startup=startup,
-                             shutdown=shutdown, name=name, dtype=dtype,
-                             value=value, max_length=max_length,
-                             alarm_group=alarm_group, read_only=read_only,
-                             doc=doc, fields=fields, cls_kwargs=cls_kwargs)
+        self.pvspec = PVSpec(
+            get=get, put=put, startup=startup, shutdown=shutdown, name=name,
+            dtype=dtype, value=value, max_length=max_length,
+            alarm_group=alarm_group, read_only=read_only, doc=doc,
+            fields=getattr(self.field_spec, 'fields', None),
+            cls_kwargs=cls_kwargs)
         self.__doc__ = doc
 
-    @property
-    def record_type(self):
-        'Record type if mocking a record (or None)'
-        return self.pvspec.cls_kwargs.get('mock_record', None)
+    def _record_type_from_kwargs(self, cls_kwargs):
+        'Get the record type from the given class kwargs'
+        return cls_kwargs.get('record') or cls_kwargs.get('mock_record')
 
     def __get__(self, instance, owner):
+        """Descriptor method: get the pvproperty instance from a group."""
         if instance is None:
-            return self.pvspec
+            # `class.pvproperty`
+            return self
+
         return instance.attr_pvdb[self.attr_name]
 
     def __set__(self, instance, value):
+        """Descriptor method: set the pvproperty instance in a group."""
         instance.attr_pvdb[self.attr_name] = value
 
     def __delete__(self, instance):
+        """Descriptor method: delete the pvproperty instance from a group."""
         del instance.attr_pvdb[self.attr_name]
 
     def __set_name__(self, owner, name):
+        """Descriptor method: auto-called to set the attribute name."""
         self.attr_name = name
         # update the PV specification with the attribute name
         self.pvspec = self.pvspec.new_names(
@@ -478,30 +688,37 @@ class pvproperty:
             else self.attr_name)
 
     def getter(self, get):
-        # update PVSpec with getter
+        """
+        Usually used as a decorator, this sets the ``getter`` in the PVSpec.
+        """
         self.pvspec = self.pvspec._replace(get=get)
         return self
 
     def putter(self, put):
-        # update PVSpec with putter
+        """
+        Usually used as a decorator, this sets the ``putter`` in the PVSpec.
+        """
         self.pvspec = self.pvspec._replace(put=put)
         return self
 
     def startup(self, startup):
-        # update PVSpec with startup function
+        """
+        Usually used as a decorator, this sets ``startup`` in the PVSpec.
+        """
         self.pvspec = self.pvspec._replace(startup=startup)
         return self
 
     def shutdown(self, shutdown):
-        # update PVSpec with shutdown function
-        self.pvspec = PVSpec(self.pvspec.get, self.pvspec.put,
-                             self.pvspec.startup, shutdown,
-                             *self.pvspec[4:])
+        """
+        Usually used as a decorator, this sets ``shutdown`` in the PVSpec.
+        """
+        self.pvspec = self.pvspec._replace(shutdown=shutdown)
         return self
 
     def scan(self, period, *, subtract_elapsed=True, stop_on_error=False,
              failure_severity=AlarmSeverity.MAJOR_ALARM, use_scan_field=False):
-        '''Periodically call a function to update a pvproperty.
+        """
+        Periodically call a function to update a pvproperty.
 
         NOTE: This replaces the pvproperty startup function. Only one or the
         other can be specified.
@@ -525,7 +742,7 @@ class pvproperty:
             A wrapper that should be used with an async function matching the
             pvproperty startup function signature:
                 (group, instance, async_library)
-        '''
+        """
         # TODO: maybe allow rate to be tied to a PV (e.g., a SCAN field?)
         def wrapper(scan_function):
             async def call_scan_function(group, prop, async_lib):
@@ -621,7 +838,8 @@ class pvproperty:
 
 
 class NestedPvproperty(pvproperty):
-    '''Nested pvproperty which allows decorator usage in parent class
+    """
+    Nested pvproperty which allows decorator usage in parent class
 
     Without using this for the SubGroups, using @subgroup.prop.getter causes
     the parent class to see multiple pvproperties - one defined on the
@@ -630,7 +848,7 @@ class NestedPvproperty(pvproperty):
 
     Bonus points if you understood all of that.
         ... scratch that, bonus points to me, I think.
-    '''
+    """
 
     def getter(self, get):
         super().getter(get)
@@ -656,20 +874,21 @@ class NestedPvproperty(pvproperty):
 
 
 class SubGroup:
-    '''A property-like descriptor for specifying a subgroup in a PVGroup
+    """
+    A property-like descriptor for specifying a subgroup in a PVGroup.
 
     Several methods of generating a SubGroup are possible. For the `group`
     parameter, one can
     1. Pass in a group_dict of {attr: pvspec_or_dict}
     2. Pass in an existing PVGroup class
     3. Use @SubGroup as a decorator on a subsequently-defined PVGroup class
-    '''
+    """
 
     # support copy.copy by keeping this here
     _class_dict = None
 
     def __init__(self, group=None, *, prefix=None, macros=None,
-                 attr_separator=None, doc=None, base=None):
+                 attr_separator=None, doc=None, base=None, **init_kwargs):
         self.attr_name = None  # to be set later
 
         # group_dict is passed in -> generate class_dict -> generate group_cls
@@ -682,6 +901,7 @@ class SubGroup:
             self.attr_separator = attr_separator
         self.base = (PVGroup, ) if base is None else base
         self.__doc__ = doc
+        self.init_kwargs = init_kwargs
         # Set last with setter
         self.group = group
 
@@ -721,12 +941,11 @@ class SubGroup:
             if 'attr' not in info:
                 info['attr'] = attr
             return PVSpec(**info)
-        elif isinstance(info, PVSpec):
+        if isinstance(info, PVSpec):
             return info
-        elif isinstance(info, pvproperty):
+        if isinstance(info, pvproperty):
             return info.pvspec
-        else:
-            raise CaprotoTypeError(f'Unknown type for pvspec: {info!r}')
+        raise CaprotoTypeError(f'Unknown type for pvspec: {info!r}')
 
     def _generate_class_dict(self):
         'Create the class dictionary from all PVSpecs'
@@ -803,22 +1022,114 @@ class SubGroup:
 
 
 def get_pv_pair_wrapper(setpoint_suffix='', readback_suffix='_RBV'):
-    'Generates a Subgroup class for a pair of PVs (setpoint and readback)'
-    def wrapped(*, name=None, dtype=int, doc=None, **kwargs):
-        return SubGroup(
-            {'setpoint': dict(dtype=dtype, name=setpoint_suffix, doc=doc,
-                              **kwargs),
-             'readback': dict(dtype=dtype, name=readback_suffix, doc=doc,
-                              read_only=True, **kwargs),
-             },
-            attr_separator='',
-            doc=doc,
-            prefix=name,
+    """
+    Generates a Subgroup class for a pair of PVs (setpoint and readback).
+
+    If no put method is defined for the setter, a default will be specified
+    which updates the readback value on write.
+
+    Parameters
+    ----------
+    setpoint_suffix : str, optional
+        The suffix for the setpoint PV
+    readback_suffix : str, optional
+        The suffix for the readback PV
+
+    Returns
+    -------
+    wrapper : callable
+        A wrapper that creates a SubGroup.  It accepts all arguments used for
+        PVSpec (or pvproperty).  Additionally, keywords meant only for the
+        setpoint or readback classes may be specified using `setpoint_kw` or
+        `readback_kw`, respectively.
+    """
+
+    def wrapped(*, get=None, put=None, startup=None, shutdown=None, name=None,
+                dtype=None, value=None, max_length=None, alarm_group=None,
+                doc=None, fields=None, setpoint_kw=None, readback_kw=None,
+                **cls_kwargs):
+        if cls_kwargs.pop('read_only', None) not in (None, False):
+            raise RuntimeError('Read-only settings for a setpoint/readback '
+                               'pair should not be specified')
+
+        pvspec_kwargs = dict(
+            startup=startup, shutdown=shutdown, dtype=dtype, value=value,
+            max_length=max_length, alarm_group=alarm_group, doc=doc,
+            fields=fields
         )
+
+        if put is None:
+            # Create a default putter method
+            async def put(obj, instance, value):
+                'Default putter - assign value to readback'
+                await obj.readback.write(value)
+
+        def get_kwargs(user_specified_kwargs, **init_kwargs):
+            for key, val in (user_specified_kwargs or {}).items():
+                if key in init_kwargs:
+                    init_kwargs[key] = val
+                else:
+                    init_kwargs['cls_kwargs'][key] = val
+            return init_kwargs
+
+        setpoint = get_kwargs(
+            setpoint_kw,
+            name=setpoint_suffix, put=put, read_only=False,
+            cls_kwargs=dict(cls_kwargs),
+            **pvspec_kwargs,
+        )
+
+        readback = get_kwargs(
+            readback_kw,
+            name=readback_suffix, get=get, read_only=True,
+            cls_kwargs=dict(cls_kwargs),
+            **pvspec_kwargs
+        )
+
+        return SubGroup(
+            dict(setpoint=setpoint, readback=readback),
+            attr_separator='', doc=doc, prefix=name,
+        )
+
     return wrapped
 
 
 class pvfunction(SubGroup):
+    """
+    A descriptor for making an RPC-like function.
+
+    Note: Requires Python type hinting for all arguments to the function and
+    its return value. These are used to generate the PVs.
+
+    It's worth noting that this is not particularly very useful when multiple
+    clients are accessing the same IOC, which is rather the point of EPICS,
+    isn't it?  That being said, this reflects an intended API for when
+    future pvAccess support gets added.
+
+    Parameters
+    ----------
+    func : async callable, optional
+        The function to wrap
+    default : any, optional
+        Default value for the return value
+    names : dict, optional
+        Valid keys include {'process', 'retval', 'status'} and also any
+        function argument names. This will map attributes of the
+        dynamically-generated PVGroup that this pvfunction represents to
+        EPICS PV names.
+    alarm_group : str, optional
+        The alarm group name this group should be associated with
+    prefix : str, optional
+        The prefix for all PVs
+    macros : dict, optional
+        Macro dictionary for PVs
+    attr_separator : str, optional
+        String separator between {prefix} and {attribute} for generated PV
+        names.
+    doc : str, optional
+        Docstring
+    """
+
     default_names = dict(process='Process',
                          retval='Retval',
                          status='Status',
@@ -826,37 +1137,6 @@ class pvfunction(SubGroup):
 
     def __init__(self, func=None, default=None, names=None, alarm_group=None,
                  prefix=None, macros=None, attr_separator=None, doc=None):
-
-        '''
-        A descriptor for making an RPC-like function
-
-        Note: Requires Python type hinting for all arguments to the function
-        and its return value. These are used to generate the PVs.
-
-        Parameters
-        ----------
-        func : async callable, optional
-            The function to wrap
-        default : any, optional
-            Default value for the return value
-        names : dict, optional
-            Valid keys include {'process', 'retval', 'status'} and also any
-            function argument names. This will map attributes of the
-            dynamically-generated PVGroup that this pvfunction represents to
-            EPICS PV names.
-        alarm_group : str, optional
-            The alarm group name this group should be associated with
-        prefix : str, optional
-            The prefix for all PVs
-        macros : dict, optional
-            Macro dictionary for PVs
-        attr_separator : str, optional
-            String separator between {prefix} and {attribute} for generated PV
-            names.
-        doc : str, optional
-            Docstring
-        '''
-
         super().__init__(group=None, prefix=prefix, macros=macros,
                          attr_separator=attr_separator, doc=doc)
         self.default_retval = default
@@ -940,7 +1220,7 @@ class pvfunction(SubGroup):
                           }
                 value = await self.func(group, **kwargs)
                 await group.retval.write(value)
-                await group.status.write(f'Success')
+                await group.status.write('Success')
             except Exception as ex:
                 await group.status.write(f'{ex.__class__.__name__}: {ex}')
                 raise
@@ -1052,22 +1332,31 @@ class PVGroupMeta(type):
 
                 bad_kw = set(pvspec.cls_kwargs) - prop_cls._valid_init_kw
                 if bad_kw:
-                    raise CaprotoValueError(f'Bad kw for class {prop_cls}: {bad_kw}')
+                    raise CaprotoValueError(
+                        f'{cls.__name__}.{attr}: Bad kw for class {prop_cls}: '
+                        f'{bad_kw}'
+                    )
 
         return cls
 
 
 def data_class_from_pvspec(group, pvspec):
     'Return the data class for a given PVSpec in a group'
-    if pvspec.read_only:
-        return group.type_map_read_only[pvspec.dtype]
+    dtype = pvspec.dtype
 
-    return group.type_map[pvspec.dtype]
+    # A special case for integer enums:
+    if inspect.isclass(dtype) and issubclass(dtype, enum.IntEnum):
+        dtype = enum.IntEnum
+
+    if pvspec.read_only:
+        return group.type_map_read_only[dtype]
+
+    return group.type_map[dtype]
 
 
 def channeldata_from_pvspec(group, pvspec):
     'Create a ChannelData instance based on a PVSpec'
-    full_pvname = expand_macros(group.prefix + pvspec.name, group.macros)
+    full_pvname = group.prefix + expand_macros(pvspec.name, group.macros)
     value = (pvspec.value
              if pvspec.value is not None
              else group.default_values[pvspec.dtype]
@@ -1085,7 +1374,7 @@ def channeldata_from_pvspec(group, pvspec):
 
 
 class PVGroup(metaclass=PVGroupMeta):
-    '''
+    """
     Class which groups a set of PVs for a high-level caproto server
 
     Parameters
@@ -1101,7 +1390,7 @@ class PVGroup(metaclass=PVGroupMeta):
     states : dict, optional
         A dictionary of states used for channel filtering. See
         https://epics.anl.gov/base/R3-15/5-docs/filters.html
-    '''
+    """
 
     type_map = {
         str: PvpropertyChar,
@@ -1109,11 +1398,13 @@ class PVGroup(metaclass=PVGroupMeta):
         int: PvpropertyInteger,
         float: PvpropertyDouble,
         bool: PvpropertyBoolEnum,
+        enum.IntEnum: PvpropertyEnum,
 
         ChannelType.STRING: PvpropertyString,
         ChannelType.INT: PvpropertyShort,
         ChannelType.LONG: PvpropertyInteger,
         ChannelType.DOUBLE: PvpropertyDouble,
+        ChannelType.FLOAT: PvpropertyFloat,
         ChannelType.ENUM: PvpropertyEnum,
         ChannelType.CHAR: PvpropertyChar,
     }
@@ -1134,6 +1425,7 @@ class PVGroup(metaclass=PVGroupMeta):
         ChannelType.INT: 0,
         ChannelType.LONG: 0,
         ChannelType.DOUBLE: 0.0,
+        ChannelType.FLOAT: 0.0,
         ChannelType.ENUM: 0,
         ChannelType.CHAR: '',
     }
@@ -1188,7 +1480,7 @@ class PVGroup(metaclass=PVGroupMeta):
             base = self.__class__.__module__
 
         # Instantiate the logger
-        self.log = logging.getLogger('{base}.{log_name}')
+        self.log = logging.getLogger(f'{base}.{log_name}')
         self._create_pvdb()
 
         # Prime the snapshots to the current state.
@@ -1215,7 +1507,8 @@ class PVGroup(metaclass=PVGroupMeta):
 
             # instantiate the subgroup
             inst = subgroup_cls(prefix=prefix, macros=macros, parent=self,
-                                name=f'{self.name}.{attr}')
+                                name=f'{self.name}.{attr}',
+                                **subgroup.init_kwargs)
             self.groups[attr] = inst
 
             # find all sub-subgroups, giving direct access to them
@@ -1253,11 +1546,10 @@ class PVGroup(metaclass=PVGroupMeta):
 
     async def group_read(self, instance):
         'Generic read called for channels without `get` defined'
-        self.log.debug('no-op group read of %s', instance.pvspec.attr)
 
     async def group_write(self, instance, value):
         'Generic write called for channels without `put` defined'
-        self.log.debug('group write of %s = %s', instance.pvspec.attr, value)
+        self.log.debug('group_write: %s = %s', instance.pvspec.attr, value)
         return value
 
 
@@ -1327,8 +1619,10 @@ def template_arg_parser(*, desc, default_prefix, argv=None, macros=None,
             parser.add_argument(f'--{name}', type=str, required=True,
                                 help="Macro substitution required by this IOC")
         else:
-            parser.add_argument(f'--{name}', type=str, default=default_value,
-                                help="Macro substitution, optional")
+            parser.add_argument(
+                f'--{name}', type=str, default=default_value,
+                help=f"Optional macro substitution, default: {default_value!r}"
+            )
 
     def split_args(args):
         """

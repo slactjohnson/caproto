@@ -2,22 +2,21 @@ import array
 import functools
 import logging
 import os
-import pytest
 import signal
 import subprocess
 import sys
 import threading
 import time
 import uuid
-
 from types import SimpleNamespace
 
-import caproto as ca
-import caproto.benchmarking  # noqa
-from caproto.sync.client import read
-import caproto.threading  # noqa
-import caproto.asyncio  # noqa
+import pytest
 
+import caproto as ca
+import caproto.asyncio  # noqa
+import caproto.benchmarking  # noqa
+import caproto.threading  # noqa
+from caproto.sync.client import read
 
 _repeater_process = None
 
@@ -113,15 +112,18 @@ def run_example_ioc(module_name, *, request, pv_to_check, args=None,
             poll_timeout, poll_attempts = 1.0, 5
 
         poll_readiness(pv_to_check, timeout=poll_timeout,
-                       attempts=poll_attempts)
+                       attempts=poll_attempts, process=p)
 
     return p
 
 
-def poll_readiness(pv_to_check, attempts=5, timeout=1):
+def poll_readiness(pv_to_check, attempts=5, timeout=1, process=None):
     logger.debug(f'Checking PV {pv_to_check}')
     start_repeater()
-    for attempt in range(attempts):
+    for _attempt in range(attempts):
+        if process is not None and process.returncode is not None:
+            raise TimeoutError(f'IOC process exited: {process.returncode}')
+
         try:
             read(pv_to_check, timeout=timeout, repeater=False)
         except (TimeoutError, ConnectionRefusedError):
@@ -140,19 +142,19 @@ def run_softioc(request, db, additional_db=None, **kwargs):
         db_text = '\n'.join((db_text, additional_db))
 
     err = None
-    for attempt in range(3):
+    for _attempt in range(3):
         ioc_handler = ca.benchmarking.IocHandler()
         ioc_handler.setup_ioc(db_text=db_text, max_array_bytes='10000000',
                               **kwargs)
 
-        request.addfinalizer(ioc_handler.teardown)
-
         (pv_to_check, _), *_ = db
         try:
-            poll_readiness(pv_to_check)
+            poll_readiness(pv_to_check, process=ioc_handler.processes[0])
         except TimeoutError as err_:
             err = err_
+            ioc_handler.teardown()
         else:
+            request.addfinalizer(ioc_handler.teardown)
             return ioc_handler
     else:
         # ran out of retry attempts
@@ -166,13 +168,15 @@ def prefix():
 
 
 def _epics_base_ioc(prefix, request):
+    if not ca.benchmarking.has_softioc():
+        pytest.skip('no softIoc')
     name = 'Waveform and standard record IOC'
     db = {
         ('{}waveform'.format(prefix), 'waveform'):
             dict(FTVL='LONG', NELM=4000),
         ('{}float'.format(prefix), 'ai'): dict(VAL=3.14),
         ('{}enum'.format(prefix), 'bi'):
-            dict(VAL=1, ZNAM="zero", ONAM="one"),
+            dict(VAL=1, ZNAM="a", ONAM="b"),
         ('{}str'.format(prefix), 'stringout'): dict(VAL='test'),
         ('{}int'.format(prefix), 'longout'): dict(VAL=1),
         ('{}int2'.format(prefix), 'longout'): dict(VAL=1),
@@ -193,10 +197,10 @@ def _epics_base_ioc(prefix, request):
         process.wait()
         with exit_lock:
             monitor_output.extend([
-                f'***********************************',
-                f'********IOC process exited!********',
+                '***********************************',
+                '********IOC process exited!********',
                 f'******* Returned: {process.returncode} ******',
-                f'***********************************''',
+                '***********************************',
             ])
 
             stdout, stderr = process.communicate()
@@ -431,6 +435,7 @@ def curio_server(prefix):
     # Hide these imports so that the other fixtures are usable by other
     # libraries (e.g. ophyd) without the experimental dependencies.
     import curio
+
     import caproto.curio
 
     async def _server(pvdb):
@@ -456,46 +461,6 @@ def curio_server(prefix):
     return run_server, prefix, caget_pvdb
 
 
-async def get_curio_context():
-    logger.debug('New curio broadcaster')
-    # Hide this import so that the other fixtures are usable by other
-    # libraries (e.g. ophyd) without the experimental dependencies.
-    import caproto.curio
-    broadcaster = caproto.curio.client.SharedBroadcaster()
-    logger.debug('Registering...')
-    await broadcaster.register()
-    logger.debug('Registered! Returning new context.')
-    return caproto.curio.client.Context(broadcaster)
-
-
-def run_with_trio_context(func, **kwargs):
-    # Hide these imports so that the other fixtures are usable by other
-    # libraries (e.g. ophyd) without the experimental dependencies.
-    import caproto.trio
-    import trio
-
-    async def runner():
-        async with trio.open_nursery() as nursery:
-            logger.debug('New trio broadcaster')
-            broadcaster = caproto.trio.client.SharedBroadcaster(
-                nursery=nursery)
-
-            logger.debug('Registering...')
-            await broadcaster.register()
-            logger.debug('Registered! Returning new context.')
-            context = caproto.trio.client.Context(broadcaster, nursery=nursery)
-            ret = await func(context=context, **kwargs)
-
-            logger.debug('Shutting down the broadcaster')
-            await broadcaster.disconnect()
-            logger.debug('And the context')
-            # await context.stop()
-            nursery.cancel_scope.cancel()
-            return ret
-
-    return trio.run(runner)
-
-
 @pytest.fixture(scope='function',
                 params=['curio', 'trio', 'asyncio'])
 def server(request):
@@ -504,6 +469,7 @@ def server(request):
         # Hide these imports so that the other fixtures are usable by other
         # libraries (e.g. ophyd) without the experimental dependencies.
         import curio
+
         import caproto.curio
 
         async def server_main():
@@ -531,7 +497,7 @@ def server(request):
                     else:
                         break
                 else:
-                    raise TimeoutError(f"ioc failed to start")
+                    raise TimeoutError("ioc failed to start")
             finally:
                 await server_task.cancel()
 
@@ -542,6 +508,7 @@ def server(request):
         # Hide these imports so that the other fixtures are usable by other
         # libraries (e.g. ophyd) without the experimental dependencies.
         import trio
+
         import caproto.trio
 
         async def trio_server_main(task_status):
@@ -560,7 +527,7 @@ def server(request):
                 for _ in range(15):
                     try:
                         if threaded_client:
-                            await trio.run_sync_in_worker_thread(client)
+                            await trio.to_thread.run_sync(client)
                         else:
                             await client(test_nursery, server_context)
                     except TimeoutError:
@@ -642,17 +609,6 @@ def circuit_pair(request):
     return cli_circuit, srv_circuit
 
 
-# Import the pytest-benchmark -> asv shim if both are available
-try:
-    __import__('pytest_benchmark')
-    __import__('asv')
-except ImportError as ex:
-    print('{} is missing'.format(ex))
-else:
-    from ._asv_shim import get_conftest_globals
-    globals().update(**get_conftest_globals())
-
-
 def threaded_in_curio_wrapper(fcn):
     '''Run a threaded test with curio support
 
@@ -688,7 +644,7 @@ def threaded_in_curio_wrapper(fcn):
 
 @pytest.fixture(scope='function', params=['array', 'numpy'])
 def backends(request):
-    from caproto import select_backend, backend
+    from caproto import backend, select_backend
 
     def switch_back():
         select_backend(initial_backend)
@@ -751,3 +707,8 @@ def pytest_runtest_call(item):
 
     item.user_properties.append(('total_sockets', num_sockets))
     item.user_properties.append(('open_sockets', num_open))
+
+
+@pytest.fixture(scope='session', params=list(ca.server.records.records))
+def record_type_name(request):
+    return request.param

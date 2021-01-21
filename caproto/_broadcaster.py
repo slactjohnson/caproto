@@ -2,16 +2,12 @@
 # one Channel Access UDP connection, intended to be used as a companion to a
 # UDP socket provided by a client or server implementation.
 import logging
-import random
 
-from ._constants import (DEFAULT_PROTOCOL_VERSION, MAX_ID)
-from ._utils import (CLIENT, SERVER, CaprotoValueError,
-                     RemoteProtocolError, ThreadsafeCounter)
-from ._commands import (Beacon, RepeaterConfirmResponse, RepeaterRegisterRequest,
-                        SearchRequest, SearchResponse, VersionRequest,
-                        read_datagram,
-                        )
-from ._log import search_logger
+from ._commands import (Beacon, RepeaterConfirmResponse,
+                        RepeaterRegisterRequest, SearchRequest, SearchResponse,
+                        read_datagram)
+from ._constants import DEFAULT_PROTOCOL_VERSION
+from ._utils import CLIENT, SERVER, CaprotoValueError, RemoteProtocolError
 
 __all__ = ('Broadcaster',)
 
@@ -40,28 +36,36 @@ class Broadcaster:
             self.their_role = SERVER
         else:
             self.their_role = CLIENT
-        self.our_address = None
-        self._our_addresses = []
+        # Whereas VirtualCircuit has one client address and one server address,
+        # the Broadcaster has multiple addresses on the server side (one per
+        # interface that it listens on) and one on the client side.
+        # We also provide the properties `our_addresses` and `their_addresses`,
+        # whose meaning depends on our_role. Whichever one corresponds to the
+        # client role will have a length of one.
+        self.server_addresses = []
+        self.client_address = None
         self.protocol_version = protocol_version
-        self.unanswered_searches = {}  # map search id (cid) to name
         # Unlike VirtualCircuit and Channel, there is very little state to
         # track for the Broadcaster. We don't need a full state machine, just
         # one flag to check whether we have yet registered with a repeater.
         self._registered = False
-        self._search_id_counter = ThreadsafeCounter(
-            initial_value=random.randint(0, MAX_ID),
-            dont_clash_with=self.unanswered_searches,
-        )
         self.log = logging.getLogger("caproto.bcast")
         self.beacon_log = logging.getLogger('caproto.bcast.beacon')
+        self.search_log = logging.getLogger('caproto.bcast.search')
 
     @property
     def our_addresses(self):
-        return self._our_addresses
+        if self.our_role is CLIENT:
+            return [self.client_address]  # always return a list
+        else:
+            return self.server_addresses
 
-    @our_addresses.setter
-    def our_addresses(self, value):
-        self._our_addresses = value
+    @property
+    def their_addresses(self):
+        if self.their_role is CLIENT:
+            return [self.client_address]  # always return a list
+        else:
+            return self.server_addresses
 
     def send(self, *commands):
         """
@@ -80,16 +84,15 @@ class Broadcaster:
             bytes to send over a socket
         """
         bytes_to_send = b''
-        history = []
         total_commands = len(commands)
         tags = {'role': repr(self.our_role)}
         for i, command in enumerate(commands):
-            if hasattr(command, 'name'):
-                tags['pv'] = command.name
-            for address in self._our_addresses:
-                tags['our_address'] = address
-                search_logger.debug(f"%d of %d %r", 1 + i, total_commands, command, extra=tags)
-            self._process_command(self.our_role, command, history=history)
+            tags['counter'] = (1 + i, total_commands)
+            if isinstance(command, (SearchRequest, SearchResponse)):
+                self.search_log.debug("%r", command, extra=tags)
+            else:
+                self.log.debug("%r", command, extra=tags)
+            self._process_command(self.our_role, command)
             bytes_to_send += bytes(command)
         return bytes_to_send
 
@@ -121,12 +124,14 @@ class Broadcaster:
                 'direction': '<<<---',
                 'role': repr(self.our_role)}
         for command in commands:
-            for address in self._our_addresses:
+            tags['bytesize'] = len(command)
+            for address in self.our_addresses:
                 tags['our_address'] = address
                 if isinstance(command, Beacon):
-                    self.beacon_log.debug("%s:%d (%dB) %r", *address, len(command), command, extra=tags)
+                    log = self.beacon_log
                 else:
-                    self.log.debug("(%dB) %r", len(command), command, extra=tags)
+                    log = self.log
+                log.debug("%r", command, extra=tags)
         return commands
 
     def process_commands(self, commands):
@@ -136,11 +141,10 @@ class Broadcaster:
         Received commands should be passed through here before any additional
         processing by a server or client layer.
         """
-        history = []
         for command in commands:
-            self._process_command(self.their_role, command, history)
+            self._process_command(self.their_role, command)
 
-    def _process_command(self, role, command, history):
+    def _process_command(self, role, command):
         """
         All comands go through here.
 
@@ -151,57 +155,10 @@ class Broadcaster:
         history : list
             This input will be mutated: command will be appended at the end.
         """
-        # All commands go through here.
-        if isinstance(command, SearchRequest):
-            # TODO do all clients respect this?
-            # We have a report of clients that do not so skip this
-            # validation.
-            # if VersionRequest not in map(type, history):
-            #     err = get_exception(self.our_role, command)
-            #     raise err("A broadcasted SearchRequest must be preceded by a "
-            #               "VersionRequest in the same datagram.")
-            self.unanswered_searches[command.cid] = command.name
-        elif isinstance(command, SearchResponse):
-            # TODO Do all versions of Rsrv respect this? Unclear why softIoc
-            # seems to sometimes violate this part of the protocol.
-            # if VersionResponse not in map(type, history):
-            #     err = get_exception(self.our_role, command)
-            #     raise err("A broadcasted SearchResponse must be preceded by "
-            #               "a VersionResponse in the same datagram.")
-            self.unanswered_searches.pop(command.cid, None)
-        elif isinstance(command, RepeaterConfirmResponse):
+        if isinstance(command, RepeaterConfirmResponse):
             self._registered = True
 
-        history.append(command)
-
     # CONVENIENCE METHODS
-
-    def new_search_id(self):
-        # Return the next sequential unused id. Wrap back to 0 on overflow.
-        return self._search_id_counter()
-
-    def search(self, name, *, cid=None):
-        """
-        Generate a valid :class:`VersionRequest` and :class:`SearchRequest`.
-
-        The protocol requires that these be transmitted together as part of one
-        datagram.
-
-        Parameters
-        ----------
-        name : string
-            Channnel name (PV)
-
-        Returns
-        -------
-        (VersionRequest, SearchRequest)
-        """
-        if cid is None:
-            # TODO all client implementations want to handle cids on their own.
-            cid = self.new_search_id()
-        commands = (VersionRequest(0, self.protocol_version),
-                    SearchRequest(name, cid, self.protocol_version))
-        return commands
 
     def register(self, ip='0.0.0.0'):
         """

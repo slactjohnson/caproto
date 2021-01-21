@@ -2,7 +2,7 @@
 caproto: a pure-Python Channel Access protocol library
 ******************************************************
 
-Caproto is a implementation of the
+Caproto is an implementation of the
 `EPICS <http://www.aps.anl.gov/epics/>`_ Channel Access protocol for
 distributed hardware control in pure Python with a "sans-I/O" architecture.
 
@@ -111,6 +111,12 @@ We would advise those kinds of users to steer well clear of caproto. It is best
 suited to applications that reward convenience, fast iteration, and
 accessibility.
 
+What about pvAccess?
+====================
+
+Caproto offers *very* preliminary pvAccess support.  See more in the
+:doc:`pva/index` section.
+
 Vital Statistics
 ================
 
@@ -147,10 +153,12 @@ learning exercises.
 
    clients
    iocs
-   mock-records
+   records
    servers
    shark
    loggers
+   cookiecutter
+   own_docs
 
 .. toctree::
    :maxdepth: 2
@@ -160,10 +168,19 @@ learning exercises.
    api
 
 .. toctree::
+   :maxdepth: 4
+   :caption: pvAccess
+
+   pva/index
+   pva/clients
+   pva/iocs
+   pva/api
+
+.. toctree::
    :maxdepth: 2
    :caption: Appendix
 
-   Performance Benchmarks <https://nsls-ii.github.io/caproto/bench/#/>
    protocol-compliance
    references
    release-notes
+   containers

@@ -10,7 +10,7 @@ import pytest
 import caproto as ca
 
 from caproto import ChannelType
-from .epics_test_utils import (run_caget, run_caput)
+from .epics_test_utils import (run_caget, run_caput, has_caget, has_caput)
 from .conftest import array_types, run_example_ioc
 from caproto.sync.client import write, read, ErrorResponseReceived
 
@@ -41,6 +41,7 @@ caget_checks += [('char', ChannelType.CHAR),
                  ]
 
 
+@pytest.mark.skipif(not has_caget(), reason='No caget binary')
 @pytest.mark.parametrize('pv, dbr_type', caget_checks)
 def test_with_caget(backends, prefix, pvdb_from_server_example, server, pv,
                     dbr_type):
@@ -186,6 +187,7 @@ caput_checks = [('int', '1', 1),
                 ]
 
 
+@pytest.mark.skipif(not has_caput(), reason='No caput binary')
 @pytest.mark.parametrize('pv, put_value, check_value', caput_checks)
 def test_with_caput(backends, prefix, pvdb_from_server_example, server, pv,
                     put_value, check_value):
@@ -202,7 +204,7 @@ def test_with_caput(backends, prefix, pvdb_from_server_example, server, pv,
         # args are ignored for curio and trio servers.
         print('* client put test: {} put value: {} check value: {}'
               ''.format(pv, put_value, check_value))
-        print('(client args: %s)'.format(client_args))
+        print('(client args: {})'.format(client_args))
 
         db_entry = caget_pvdb[pv]
         db_old = db_entry.value
@@ -283,6 +285,7 @@ def test_empties_with_caproto_client(request, caproto_ioc):
     assert list(read(caproto_ioc.pvs['empty_float']).data) == []
 
 
+@pytest.mark.skipif(not has_caget(), reason='No caget binary')
 def test_empties_with_caget(request, caproto_ioc):
     async def test():
         info = await run_caget('asyncio', caproto_ioc.pvs['empty_string'])
@@ -325,7 +328,7 @@ def test_write_without_notify(request, prefix, async_lib):
                     pv_to_check=pv)
     write(pv, 3.179, notify=False)
     # We do not get notified so we have to poll for an update.
-    for attempt in range(20):
+    for _attempt in range(20):
         if read(pv).data[0] > 3.178:
             break
         time.sleep(0.1)
@@ -362,3 +365,14 @@ def test_data_copy(cls, kwargs):
     patch_alarm(args1)
     patch_alarm(args2)
     assert args1 == args2
+
+
+@pytest.mark.parametrize('async_lib', ['asyncio', 'curio', 'trio'])
+def test_process_field(request, prefix, async_lib):
+    run_example_ioc('caproto.tests.ioc_process', request=request,
+                    args=['--prefix', prefix, '--async-lib', async_lib],
+                    pv_to_check=f'{prefix}record.PROC')
+
+    write(f'{prefix}record.PROC', [1], notify=True)
+    write(f'{prefix}record.PROC', [1], notify=True)
+    assert read(f'{prefix}count').data[0] == 2

@@ -2,6 +2,254 @@
 Release History
 ***************
 
+v0.7.1 (2020-01-13)
+===================
+
+Fixed
+-----
+
+- For ``pvproperty``, avoid multiple passes of macro expansion, such that
+  ``{{`` is sufficient to escape an opening curly bracket.
+- The server implementation will now catch when `socket.recv` raises `OSError`.
+- Broken entrypoints have been fixed for the pathological examples,
+  ``defaultdict_server`` and ``spoof_beamline``.
+
+Added
+-----
+
+- Show default values for optional macro substitution for IOCs using the
+  template parser.
+
+Changed
+-------
+
+- Travis CI configuration has been removed from the repository.
+
+
+v0.7.0 (2020-12-08)
+===================
+
+Fixed
+-----
+
+- Eliminate memory leak on run-longing servers were we remembered
+  every search request we saw but did not service
+- ``WaitForPlugins`` and additional PVs for compatibility were added in
+  the fancy ``spoof_beamline`` example.
+- Many more libraries are now entirely optional in the test suite.
+- ``get_pv_pair_wrapper`` now supports keyword arguments to the generated
+  ``pvproperty`` instances.
+
+Added
+-----
+
+- Added documentation notes on multi-tenant soft IOCs.
+- Added helper tools for easily auto-generating ``PVGroup``-based IOC
+  documentation with sphinx-autosummary.
+- A fake motor record IOC example, with the most common fields implemented.
+- Added iocStats-like helpers for caproto-based IOCs, which include CPU/memory
+  usage information, tools for finding memory leaks, and so on.
+- Add support for ``-#`` arguments in ``caproto-get`` and ``caproto-monitor``
+  command-line tools.
+- ``IntEnum`` values are now supported for ``pvproperty``, simplifying
+  declarations of enum PVs.
+- Added preliminary pvAccess support, including examples and documentation.
+- Added a shared memory IOC example.
+- Added a gamepad IOC example.
+- Added an IOC which generates PVs based on a formula string.
+- Added an escape hatch for pvproperty putters to skip further processing, the
+  ``SkipWrite`` exception.
+
+Changed
+-------
+
+- The search related API was removed from :class:`ca.Broadcaster`, all
+  of the search request accounting is handled in the client code.  The
+  code that is used on the servers can not do this book keeping
+  because we can not know what other servers are out there and if the
+  SearchRequest actually got serviced (as that goes back uni-cast).
+- Removed curio and trio client implementations.  These may reappear
+  in the future, based on the new asyncio client.
+- Removed unused dependency ``asks``, which was part of the full installation.
+- Documentation is now versioned on GitHub pages thanks to doctr-versions-menu.
+- Automated benchmarking code which was previously part of the test suite, has
+  been removed.
+- Unmaintained prototype-level clients based on ``trio`` and ``curio`` have
+  been removed.  The full-featured ``asyncio`` client from v0.6.0 is the
+  suggested migration path.
+- IOC examples have been reorganized.
+- Updated continuous integration to use conda-forge epics-base.
+
+
+v0.6.0 (2020-07-31)
+===================
+
+Fixed
+-----
+
+- Fixed server PVGroup logger names.  It was erroneously using the exact string
+  '{base}.{log_name}', and now will be correctly expanded to be based on either
+  the module name or the parent PVGroup's logger name.
+- Fields defined in the :class:`caproto.server.records.RecordFieldGroup` may
+  now be customized using, for example, ``@prop.fields.process_record.putter``.
+- :class:`caproto.ChannelByte` and :class:`caproto.ChannelChar` with
+  ``max_length=1`` now accept scalar integer values, whereas they were
+  previously failing due to expecting byte strings (or strings).  This arose
+  primarily in the case of record fields which attempt to reflect the actual
+  data types found in epics-base.
+
+Added
+-----
+
+- Added a new (experimental) asyncio client with features comparable to the
+  threading client.
+- Allow :class:`caproto.server.SubGroup` instances to accept keyword arguments.
+- Added autosave-like tools and an example.
+- Now using ``doctr-versions-menu`` for documentation.
+
+Changed
+-------
+
+- Significantly refactored task handling in the asyncio server.  This improves
+  the performance of write request handling and overall task cleanup.
+- Some asyncio server utilities were relocated such that the server and new
+  client can both utilize them.
+- Accessing a :class:`caproto.server.pvproperty` directly from the
+  :class:`caproto.server.PVGroup` class will no longer return a
+  :class:`caproto.server.PVSpec` instance, but the
+  :class:`caproto.server.pvproperty` itself.
+
+
+v0.5.2 (2020-06-18)
+===================
+
+Fixed
+-----
+
+- Fixed a packaging issue introduced in 0.5.1 where some files were missing
+  in the ``sdist`` source distribution package.
+- Prevent an error from occurring when trying to subscribe, with a callback,
+  to a PV that is not yet connected. The subscription will now succeed and
+  become active once the PV is fully connected.
+- Avoid duplicate registration of callbacks in ``Context.get_pvs()``.
+
+v0.5.1 (2020-06-12)
+===================
+
+Changed
+-------
+
+* Replaced usage of deprecated trio features with recommended approaches.
+* Updated curio-based server for compatibility with recent versions of curio.
+  It is now incompatible with curio < 1.2.
+
+Added
+-----
+
+* Added ``vel`` and ``mtr_tick_rate`` pvproperties to ``PinHole``, ``Edge``
+  and ``Slit`` motors on mini beamline example, to provide control over the
+  speed of the motors.
+* Added documentation on how to build and run caproto containers using
+  ``buildah`` and ``podman``.
+* Add a new ``test`` pip selector, as in ``pip install caproto[test]``, which
+  installs ``caproto[complete]`` plus the requirements for running the tests.
+
+v0.5.0 (2020-05-01)
+===================
+
+Changed
+-------
+
+* In the threading client, the expected signature of Subscription callbacks has
+  changed from ``f(response)`` to ``f(sub, response)`` where ``sub`` is the
+  pertinent :class:`caproto.threading.client.Subscription`.
+  This change has been made in a backward-compatible way. Callbacks with the
+  old signature, ``f(response)``, will still work but caproto will issue a
+  warning. Support for the old signature may be removed in the future.
+  By giving the callback ``f`` access to ``sub``, we enable usages like
+
+  .. code-block:: python
+
+     def f(sub, response):
+         # Print the name of the pertinent PV.
+         print('Received response from', sub.pv.name)
+
+     def f(sub, response):
+         if ...:
+             sub.remove_callback(f)
+
+* In the synchronous client, the expected signature of subscription callbacks
+  has changed from ``f(response)`` to ``f(pv_name, response)``. As with the
+  similar change to the threading client described above, this change was made
+  an a backward-compatible way: the old signature is still accepted but a
+  warning is issued.
+* The detail and formatting of the log messages has been improved.
+* The ``mock_record`` keyword argument to :class:`caproto.server.pvproperty`
+  has been deprecated, in favor of the simpler ``record``.
+* EPICS record field support has been regenerated with a new database
+  definition source.  This reference ``.dbd`` file can be found in a separate
+  repository `here <https://github.com/caproto/reference-dbd>`_. These fields
+  should now be more accurate than previous releases, including some initial
+  values and better enum values, and also with basic round-trip tests verifying
+  protocol compliance for each field.
+
+Added
+-----
+
+* Added IOC server support for long string PVs.
+    - Channel Access maximum string length is 40 characters
+    - However, appending ``$`` to ``DBF_STRING`` fields (e.g.,
+      ``MY:RECORD.DESC$``) changes the request to ``DBF_CHAR``, allowing for
+      effectively unlimited length of strings.
+    - This is supported for :class:`caproto.server.pvproperty` instances which
+      are initialized with a string value (or specify
+      ``caproto.ChannelType.STRING`` as the data type).
+    - This is supported internally by way of
+      :class:`caproto._data.ChannelString`, which adds an init keyword argument
+      ``long_string_max_length``.
+* Added documentation for fields of all supported record types.
+* Tools for automatically regenerating record fields and menus via a Jinja
+  template are now included. See
+  :func:`caproto.server.conversion.generate_all_records_jinja` and
+  :func:`caproto.server.conversion.generate_all_menus_jinja` and the related
+  jinja templates in ``caproto/server``.
+
+Fixed
+-----
+
+* On OSX, the creating a :class:`threading.client.Context` pinned a CPU due to
+  a busy socket selector loop.
+* When ``EPICS_CA_ADDR_LIST`` is set and nonempty and
+  ``EPICS_CA_AUTO_ADDR_LIST=YES``, the auto-detected addresses should be used
+  *in addition to* the manually specified one. They were being used *instead*
+  (with a warning issued).
+
+v0.4.4 (2020-03-26)
+===================
+
+Fixed
+-----
+
+* The fix for Python asyncio's servers released in 0.4.3 had the accidental
+  side-effect of preventing multiple servers from running on the same machine
+  (or, to be precise, on the same network interface). This release fixes that
+  regression.
+* Fix bug in ``caproto-put`` which made it impossible to set ENUM-type PVs.
+* Ensure that caproto servers respect the limits on the number of enum members
+  and the length of enum streams.
+
+v0.4.3 (2020-01-29)
+===================
+
+Python releases 3.6.10, 3.7.6, and 3.8.1 made a breaking change for security
+reasons that happens to break caproto's asyncio-based server (the default one)
+on all platforms. This release adjusts for that change. See
+:meth:`asyncio.loop.create_datagram_endpoint` for details about this change in
+Python.
+
+This release also fixes a bug introduced in v0.4.0 affecting Windows only that
+made caproto clients and servers unusuable on Windows.
+
 v0.4.2 (2019-11-13)
 ===================
 
