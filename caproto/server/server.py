@@ -13,9 +13,9 @@ import inspect
 import logging
 import sys
 import time
-import warnings
 from collections import OrderedDict, defaultdict, namedtuple
 from types import MethodType
+from typing import Optional
 
 from caproto._log import _set_handler_with_logger, set_handler
 
@@ -34,6 +34,7 @@ __all__ = ['AsyncLibraryLayer',
            'NestedPvproperty', 'PVGroup', 'PVSpec', 'SubGroup',
            'channeldata_from_pvspec', 'data_class_from_pvspec',
            'expand_macros', 'get_pv_pair_wrapper', 'pvfunction', 'pvproperty',
+           'scan_wrapper',
 
            'PvpropertyData', 'PvpropertyReadOnlyData',
            'PvpropertyByte', 'PvpropertyByteRO',
@@ -43,9 +44,10 @@ __all__ = ['AsyncLibraryLayer',
            'PvpropertyBoolEnum', 'PvpropertyBoolEnumRO',
            'PvpropertyEnum', 'PvpropertyEnumRO',
            'PvpropertyInteger', 'PvpropertyIntegerRO',
+           'PvpropertyShort', 'PvpropertyShortRO',
            'PvpropertyString', 'PvpropertyStringRO',
 
-           'ioc_arg_parser', 'template_arg_parser'
+           'ioc_arg_parser', 'template_arg_parser', 'run',
            ]
 
 
@@ -113,48 +115,62 @@ class PvpropertyData:
         Passed to the superclass, along with reported_record_type.
     """
 
-    def __init__(self, *, pvname, group, pvspec, doc=None, mock_record=None,
-                 record=None, logger=None, **kwargs):
+    def __init__(self, *, pvname, group, pvspec, doc=None, record=None,
+                 logger=None, **kwargs):
         self.pvname = pvname  # the full, expanded PV name
-        self.name = f'{group.name}.{pvspec.attr}'
-        self.group = group
-        self.log = group.log
         self.pvspec = pvspec
-        self.getter = (MethodType(pvspec.get, group)
-                       if pvspec.get is not None
-                       else group.group_read)
-        self.putter = (MethodType(pvspec.put, group)
-                       if pvspec.put is not None
-                       else group.group_write)
-        if pvspec.startup is not None:
-            # enable the startup hook for this instance only:
-            self.server_startup = self._server_startup
-            # bind the startup method to the group (used in server_startup)
-            self.startup = MethodType(pvspec.startup, group)
-        if pvspec.shutdown is not None:
-            # enable the shutdown hook for this instance only:
-            self.server_shutdown = self._server_shutdown
-            # bind the shutdown method to the group (used in server_shutdown)
-            self.shutdown = MethodType(pvspec.shutdown, group)
+        if group is not None:
+            self.name = f'{group.name}.{pvspec.attr}'
+            self.group = group
+            self.log = group.log
+            self.getter = (MethodType(pvspec.get, group)
+                           if pvspec.get is not None
+                           else group.group_read)
+            self.putter = (MethodType(pvspec.put, group)
+                           if pvspec.put is not None
+                           else group.group_write)
+            if pvspec.startup is not None:
+                # enable the startup hook for this instance only:
+                self.server_startup = self._server_startup
+                # bind the startup method to the group (used in server_startup)
+                self.startup = MethodType(pvspec.startup, group)
+            if pvspec.scan is not None:
+                # enable the scan hook for this instance only:
+                self.server_scan = self._server_scan
+                # bind the scan method to the group (used in server_scan)
+                self.scan = MethodType(pvspec.scan, group)
+            if pvspec.shutdown is not None:
+                # enable the shutdown hook for this instance only:
+                self.server_shutdown = self._server_shutdown
+                # bind the shutdown method to the group (used in server_shutdown)
+                self.shutdown = MethodType(pvspec.shutdown, group)
+        else:
+            # Without a group, some things are easier and some aren't...
+            self.name = pvspec.attr or pvspec.name
+            self.group = None
+            self.log = logger or module_logger
+            self.getter = pvspec.get
+            self.putter = pvspec.put
+            self.startup = pvspec.startup
+            self.shutdown = pvspec.shutdown
+            self.scan = pvspec.scan
+            if pvspec.startup is not None:
+                self.server_startup = self._server_startup
+            if pvspec.scan is not None:
+                self.server_scan = self._server_scan
+            if pvspec.shutdown is not None:
+                self.server_shutdown = self._server_shutdown
 
         if doc is not None:
             self.__doc__ = doc
 
-        self.record_type = record or mock_record
+        self.record_type = record
 
         # This should not be allowed to be different from record_type
         kwargs.pop('reported_record_type', None)
 
         super().__init__(reported_record_type=self.record_type or 'caproto',
                          **kwargs)
-
-        if mock_record is not None:
-            if record is not None:
-                raise ValueError(
-                    'Cannot specify both `mock_record` and `record`; '
-                    'please use only `record`')
-            warnings.warn(
-                '`mock_record` is deprecated. Use `pvproperty(record=)`')
 
         if self.record_type is not None:
             from .records import records
@@ -202,15 +218,11 @@ class PvpropertyData:
         data_type : ChannelType
             The type of data to return.
         """
-        value = await self.getter(self)
-        if value is not None:
-            if self.pvspec.get is None:
-                self.log.debug('group read value for %s updated: %r',
-                               self.name, value)
-            else:
-                self.log.debug('value for %s updated: %r', self.name, value)
-            # update the internal state
-            await self.write(value)
+        if self.getter is not None:
+            value = await self.getter(self)
+            if value is not None:
+                # Update the internal state
+                await self.write(value)
         return await self._read(data_type)
 
     async def verify_value(self, value):
@@ -227,7 +239,13 @@ class PvpropertyData:
             The value to write.
         """
         value = await super().verify_value(value)
-        return await self.putter(self, value)
+        if self.putter is not None:
+            return await self.putter(self, value)
+
+    async def update_fields(self, value):
+        """This is a hook to update field instance data."""
+        if self.field_inst is not None:
+            await self.field_inst.value_write_hook(self, value)
 
     async def _server_startup(self, async_lib):
         """A per-pvproperty startup hook; enabled at __init__ time."""
@@ -236,6 +254,10 @@ class PvpropertyData:
     async def _server_shutdown(self, async_lib):
         """A per-pvproperty shutdown hook; enabled at __init__ time."""
         return await self.shutdown(self, async_lib)
+
+    async def _server_scan(self, async_lib):
+        """A per-pvproperty 'scan' hook; enabled at __init__ time."""
+        return await self.scan(self, async_lib)
 
     def get_field(self, field):
         """
@@ -262,34 +284,36 @@ class PvpropertyData:
 
 
 class PvpropertyChar(PvpropertyData, ChannelChar):
-    ...
+    """Read-write 8-bit CHAR data for pvproperty with string encoding."""
 
 
 class PvpropertyByte(PvpropertyData, ChannelByte):
-    ...
+    """Read-write 8-bit CHAR data for pvproperty for bytes."""
 
 
 class PvpropertyShort(PvpropertyData, ChannelShort):
-    ...
+    """Read-write SHORT/INT data for pvproperty (16 bits)."""
 
 
 class PvpropertyInteger(PvpropertyData, ChannelInteger):
-    ...
+    """Read-write LONG data for pvproperty (32 bits)."""
 
 
 class PvpropertyFloat(PvpropertyData, ChannelFloat):
-    ...
+    """Read-write FLOAT data for pvproperty (32 bits)."""
 
 
 class PvpropertyDouble(PvpropertyData, ChannelDouble):
-    ...
+    """Read-write DOUBLE data for pvproperty (64 bits)."""
 
 
 class PvpropertyString(PvpropertyData, ChannelString):
-    ...
+    """Read-write STRING data for pvproperty (up to 40 chars)."""
 
 
 class PvpropertyEnum(PvpropertyData, ChannelEnum):
+    """Read-write ENUM data for pvproperty."""
+
     def __init__(self, *, enum_strings=None, value=None, **kwargs):
         if isinstance(value, enum.IntEnum):
             if enum_strings is not None:
@@ -304,6 +328,8 @@ class PvpropertyEnum(PvpropertyData, ChannelEnum):
 
 
 class PvpropertyBoolEnum(PvpropertyData, ChannelEnum):
+    """Read-write ENUM data for pvproperty, with Off/On as default strings."""
+
     def __init__(self, *, enum_strings=None, **kwargs):
         if enum_strings is None:
             enum_strings = ['Off', 'On']
@@ -311,43 +337,43 @@ class PvpropertyBoolEnum(PvpropertyData, ChannelEnum):
 
 
 class PvpropertyReadOnlyData(PvpropertyData):
-    """
-    A mixin class which marks this data as read-only from channel access.
-    """
+    """A mixin class which marks this data as read-only from channel access."""
 
     def check_access(self, host, user):
         return AccessRights.READ
 
 
 class PvpropertyCharRO(PvpropertyReadOnlyData, ChannelChar):
-    ...
+    """Read-only 8-bit CHAR data for pvproperty with string encoding."""
 
 
 class PvpropertyByteRO(PvpropertyReadOnlyData, ChannelByte):
-    ...
+    """Read-only 8-bit CHAR data for pvproperty for bytes."""
 
 
 class PvpropertyShortRO(PvpropertyReadOnlyData, ChannelShort):
-    ...
+    """Read-only SHORT/INT data for pvproperty (16 bits)."""
 
 
 class PvpropertyIntegerRO(PvpropertyReadOnlyData, ChannelInteger):
-    ...
-
-
-class PvpropertyDoubleRO(PvpropertyReadOnlyData, ChannelDouble):
-    ...
+    """Read-only LONG data for pvproperty (32 bits)."""
 
 
 class PvpropertyFloatRO(PvpropertyReadOnlyData, ChannelFloat):
-    ...
+    """Read-only FLOAT data for pvproperty (32 bits)."""
+
+
+class PvpropertyDoubleRO(PvpropertyReadOnlyData, ChannelDouble):
+    """Read-only DOUBLE data for pvproperty (64 bits)."""
 
 
 class PvpropertyStringRO(PvpropertyReadOnlyData, ChannelString):
-    ...
+    """Read-only STRING data for pvproperty (up to 40 chars)."""
 
 
 class PvpropertyEnumRO(PvpropertyReadOnlyData, ChannelEnum):
+    """Read-only ENUM data for pvproperty."""
+
     def __init__(self, *, enum_strings=None, value=None, **kwargs):
         if isinstance(value, enum.IntEnum):
             if enum_strings is not None:
@@ -362,21 +388,71 @@ class PvpropertyEnumRO(PvpropertyReadOnlyData, ChannelEnum):
 
 
 class PvpropertyBoolEnumRO(PvpropertyReadOnlyData, ChannelEnum):
+    """Read-only ENUM data for pvproperty, with Off/On as default strings."""
+
     def __init__(self, *, enum_strings=None, **kwargs):
         if enum_strings is None:
             enum_strings = ['Off', 'On']
         super().__init__(enum_strings=enum_strings, **kwargs)
 
 
+_hook_signature_info = {
+    "get": ("group", "instance"),
+    "put": ("group", "instance", "value"),
+    "startup": ("group", "instance", "async_lib"),
+    "shutdown": ("group", "instance", "async_lib"),
+    "scan": ("group", "instance", "async_lib"),
+}
+
+
+def check_signature(type_: str, func: Optional[callable], expect_method: bool):
+    """Check the signature of a hook method."""
+    if func is None:
+        return
+
+    args = _hook_signature_info[type_]
+    if not expect_method:
+        args = args[1:]  # no need for `group`
+
+    try:
+        sig = inspect.signature(func)
+        sig.bind(*args)
+    except Exception:
+        bound = False
+    else:
+        bound = True
+
+    if not bound or not inspect.iscoroutinefunction(func):
+        try:
+            source_file = inspect.getsourcefile(func)
+            _, source_line = inspect.getsourcelines(func)
+            source_info = f'{source_file}:{source_line}'
+        except Exception:
+            source_info = 'location unknown'
+
+        raise CaprotoRuntimeError(
+            f"""\
+The {type_} hook {func.__name__} ({source_info}) must be callable with a
+signature like the following:
+    async def {func.__name__}({', '.join(args)})
+""")
+
+
 class PVSpec(namedtuple('PVSpec',
                         'get put startup shutdown attr name dtype value '
-                        'max_length alarm_group read_only doc fields '
+                        'max_length alarm_group read_only doc fields scan '
+                        'record '
                         'cls_kwargs')):
     """
     PV information specification.
 
     This is an immutable tuple that contains everything needed to generate
     a `ChannelData` instance from a `pvproperty`.
+
+    This additional layer was intended to allow for alternate APIs outside of
+    `pvproperty`, but still allowing for the ease of specification of values
+    and data types rather than `ChannelData` class instances.  There are no
+    current additional APIs; this remains a hook for potential future use.
 
     Parameters
     ----------
@@ -387,6 +463,8 @@ class PVSpec(namedtuple('PVSpec',
     startup : async callable, optional
         Called at start of server; a hook for initialization and background
         processing
+    scan : async callable, optional
+        Called at periodic rates.
     shutdown : async callable, optional
         Called at shutdown of server; a hook for cleanup
     attr : str, optional
@@ -408,6 +486,10 @@ class PVSpec(namedtuple('PVSpec',
         Docstring associated with PV
     fields : tuple, optional
         Specification for record fields
+    scan : async callable, optional
+        Called at periodic rates.
+    record : str, optional
+        The record type to report for the PV.
     cls_kwargs : dict, optional
         Keyword arguments for the ChannelData-based class
     """
@@ -417,7 +499,7 @@ class PVSpec(namedtuple('PVSpec',
     def __new__(cls, get=None, put=None, startup=None, shutdown=None,
                 attr=None, name=None, dtype=None, value=None, max_length=None,
                 alarm_group=None, read_only=None, doc=None, fields=None,
-                cls_kwargs=None):
+                scan=None, record=None, cls_kwargs=None):
         if dtype is None:
             if value is None:
                 dtype = cls.default_dtype
@@ -426,50 +508,21 @@ class PVSpec(namedtuple('PVSpec',
             else:
                 dtype = type(value)
 
-        if get is not None:
-            assert inspect.iscoroutinefunction(get), 'required async def get'
-            sig = inspect.signature(get)
-            try:
-                sig.bind('group', 'instance')
-            except Exception:
-                raise CaprotoRuntimeError('Invalid signature for getter {}: {}'
-                                          ''.format(get, sig))
-
         if put is not None:
-            assert inspect.iscoroutinefunction(put), 'required async def put'
             assert not read_only, 'Read-only signal cannot have putter'
-            sig = inspect.signature(put)
-            try:
-                sig.bind('group', 'instance', 'value')
-            except Exception:
-                raise CaprotoRuntimeError('Invalid signature for putter {}: {}'
-                                          ''.format(put, sig))
 
-        if startup is not None:
-            assert inspect.iscoroutinefunction(startup), \
-                'required async def startup'
-            sig = inspect.signature(startup)
-            try:
-                sig.bind('group', 'instance', 'async_library')
-            except Exception:
-                raise CaprotoRuntimeError('Invalid signature for startup {}: {}'
-                                          ''.format(startup, sig))
-
-        if shutdown is not None:
-            assert inspect.iscoroutinefunction(shutdown), \
-                'required async def shutdown'
-            sig = inspect.signature(shutdown)
-            try:
-                sig.bind('group', 'instance', 'async_library')
-            except Exception:
-                raise CaprotoRuntimeError('Invalid signature for shutdown {}: {}'
-                                          ''.format(shutdown, sig))
+        if name and '.' in name and record:
+            raise CaprotoValueError(
+                f'Cannot specify `record` on PV with a "." in it: {name!r}'
+            )
 
         return super().__new__(cls, get=get, put=put, startup=startup,
                                shutdown=shutdown, attr=attr, name=name,
                                dtype=dtype, value=value, max_length=max_length,
                                alarm_group=alarm_group, read_only=read_only,
-                               doc=doc, fields=fields, cls_kwargs=cls_kwargs)
+                               doc=doc, fields=fields, scan=scan,
+                               record=record,
+                               cls_kwargs=cls_kwargs)
 
     def new_names(self, attr=None, name=None):
         if attr is None:
@@ -477,6 +530,180 @@ class PVSpec(namedtuple('PVSpec',
         if name is None:
             name = self.name
         return self._replace(attr=attr, name=name)
+
+    def get_data_class(self, group=None):
+        """
+        Return the data class for a given PVSpec in a group.
+
+        Parameters
+        ----------
+        group : PVGroup, optional
+            If unspecified, module-global type maps will be used.
+        """
+        if group is None:
+            type_map = pvspec_type_map
+            type_map_read_only = pvspec_type_map
+        else:
+            type_map = group.type_map
+            type_map_read_only = group.type_map_read_only
+
+        dtype = self.dtype
+
+        # A special case for integer enums:
+        if inspect.isclass(dtype) and issubclass(dtype, enum.IntEnum):
+            dtype = enum.IntEnum
+
+        if self.read_only:
+            return type_map_read_only[dtype]
+
+        return type_map[dtype]
+
+    def get_instantiation_info(self, group=None):
+        """
+        Get class and instantiation arguments, given a parent group.
+
+        Parameters
+        ----------
+        group : PVGroup, optional
+            The parent group.
+
+        Returns
+        -------
+        cls : Type[ChannelData]
+            The class to instantiate.
+
+        kwargs : dict
+            Instantiation keyword arguments.
+        """
+        if group is None:
+            full_pvname = self.name
+            value = self.value
+            if value is None:
+                # No defaults without a group.
+                raise ValueError(f"Value required for {full_pvname!r}")
+
+            # Without a group, you'll need to specify the alarm instance:
+            alarm = self.alarm_group
+        else:
+            alarm = group.alarms[self.alarm_group]
+            full_pvname = group.prefix + expand_macros(self.name, group.macros)
+
+        cls = self.get_data_class(group)
+
+        if alarm and not isinstance(alarm, ChannelAlarm):
+            raise ValueError(f"Alarm instance required for {full_pvname!r}")
+
+        value = (
+            self.value
+            if self.value is not None
+            else group.default_values[self.dtype]
+        )
+
+        return cls, dict(
+            group=group,
+            pvspec=self,
+            value=value,
+            max_length=self.max_length,
+            alarm=alarm,
+            pvname=full_pvname,
+            record=self.record,
+            **(self.cls_kwargs or {})
+        )
+
+    def create(self, group=None):
+        """Create a ChannelData instance based on this PVSpec."""
+        cls, kwargs = self.get_instantiation_info(group)
+        try:
+            inst = cls(**kwargs)
+        except Exception as ex:
+            raise CaprotoRuntimeError(
+                f"Failed to instantiate {cls.__name__!r} from PVSpec: {ex} "
+                f"(kwargs={kwargs})"
+            ) from ex
+        inst.__doc__ = self.doc
+        return inst
+
+
+def scan_wrapper(
+    scan_function, period, *, subtract_elapsed=True, stop_on_error=False,
+    failure_severity=AlarmSeverity.MAJOR_ALARM, use_scan_field=False
+):
+    """
+    Wrap a function intended for `pvproperty.scan` with common logic to
+    periodically call it.
+
+    Parameters
+    ----------
+    scan_function : async callable
+        The scan function to wrap, with expected signature:
+            (group, instance, async_library)
+    period : float
+        Wait `period` seconds between calls to the scanned function
+    subtract_elapsed : bool, optional
+        Subtract the elapsed time of the previous call from the period for
+        the subsequent iteration
+    stop_on_error : bool, optional
+        Fail (and stop scanning) when unhandled exceptions occur
+    use_scan_field : bool, optional
+        Use the .SCAN field if this pvproperty is a mocked record.  Raises
+        ValueError if ``record`` is not used.
+
+    Returns
+    -------
+    wrapped : callable
+        The wrapped ``scan`` function.
+    """
+    async def call_scan_function(group, prop, async_lib):
+        try:
+            await scan_function(group, prop, async_lib)
+        except Exception:
+            prop.log.exception('Scan exception')
+            await prop.alarm.write(
+                status=AlarmStatus.SCAN,
+                severity=failure_severity,
+            )
+            if stop_on_error:
+                raise
+        else:
+            if ((prop.alarm.severity, prop.alarm.status) ==
+                    (failure_severity, AlarmStatus.SCAN)):
+                await prop.alarm.write(
+                    status=AlarmStatus.NO_ALARM,
+                    severity=AlarmSeverity.NO_ALARM,
+                )
+
+    async def scanned_startup(group, prop, async_lib):
+        if use_scan_field and period is not None:
+            if prop.field_inst.scan_rate_sec is None:
+                # This is a hook to allow setting of the default scan rate
+                # through the 'period' argument of the decorator.
+                prop.field_inst._scan_rate_sec = period
+                # TODO: update .SCAN to reflect this number
+
+        sleep = async_lib.library.sleep
+        while True:
+            t0 = time.monotonic()
+            if use_scan_field:
+                iter_time = prop.field_inst.scan_rate_sec
+                if iter_time is None:
+                    iter_time = 0
+            else:
+                iter_time = period
+
+            if iter_time > 0:
+                await call_scan_function(group, prop, async_lib)
+            else:
+                iter_time = 0.1
+                # TODO: could the scan rate - or values in general - have
+                # events tied with them so busy loops are unnecessary?
+            elapsed = time.monotonic() - t0
+            sleep_time = (
+                max(0, iter_time - elapsed)
+                if subtract_elapsed else iter_time
+            )
+            await sleep(sleep_time)
+
+    return scanned_startup
 
 
 class FieldProxy:
@@ -506,6 +733,14 @@ class FieldProxy:
 
     def startup(self, startup):
         self.field_spec._update(self.field_name, 'startup', startup)
+        return self.field_spec.prop
+
+    def scan(self, scan):
+        self.field_spec._update(self.field_name, 'scan', scan)
+        return self.field_spec.prop
+
+    def shutdown(self, shutdown):
+        self.field_spec._update(self.field_name, 'shutdown', shutdown)
         return self.field_spec.prop
 
     def __repr__(self):
@@ -581,6 +816,9 @@ class pvproperty:
     shutdown : async callable, optional
         Called at shutdown of server; a hook for cleanup
 
+    scan : async callable, optional
+        Called periodically at a configured rate.
+
     name : str, optional
         The PV name (defaults to the attribute name of the pvproperty)
 
@@ -623,43 +861,68 @@ class pvproperty:
     """
 
     def __init__(self, get=None, put=None, startup=None, shutdown=None, *,
-                 name=None, dtype=None, value=None, max_length=None,
+                 scan=None, name=None, dtype=None, value=None, max_length=None,
                  alarm_group=None, doc=None, read_only=None, field_spec=None,
-                 fields=None, **cls_kwargs):
+                 fields=None, record=None, **cls_kwargs):
         self.attr_name = None  # to be set later
 
         if doc is None and get is not None:
             doc = get.__doc__
 
-        self.record_type = self._record_type_from_kwargs(cls_kwargs)
-
         if field_spec is not None:
-            if name and '.' in name:
-                raise ValueError(f'Cannot specify field_spec if '
-                                 f'the PV name has a "." in it: {name!r}')
-            if self.record_type:
-                raise ValueError(
+            if record and record != field_spec.record_type:
+                raise CaprotoValueError(
                     'Cannot specify both field_spec and record; the record '
-                    'type from field_spec must be used')
-            self.record_type = field_spec.record_type
-        elif self.record_type:
-            if name and '.' in name:
-                raise ValueError(f'Cannot specify a record if '
-                                 f'the PV name has a "." in it: {name!r}')
-            field_spec = FieldSpec(self, record_type=self.record_type)
+                    'type from field_spec must be used'
+                )
+            record = field_spec.record_type
+        elif record:
+            field_spec = FieldSpec(self, record_type=record)
+
+        check_signature('get', get, expect_method=True)
+        check_signature('put', put, expect_method=True)
+        check_signature('startup', startup, expect_method=True)
+        check_signature('scan', scan, expect_method=True)
+        check_signature('shutdown', shutdown, expect_method=True)
 
         self.field_spec = field_spec
         self.pvspec = PVSpec(
-            get=get, put=put, startup=startup, shutdown=shutdown, name=name,
-            dtype=dtype, value=value, max_length=max_length,
-            alarm_group=alarm_group, read_only=read_only, doc=doc,
+            get=get,
+            put=put,
+            startup=startup,
+            shutdown=shutdown,
+            name=name,
+            dtype=dtype,
+            value=value,
+            max_length=max_length,
+            alarm_group=alarm_group,
+            read_only=read_only,
+            doc=doc,
             fields=getattr(self.field_spec, 'fields', None),
-            cls_kwargs=cls_kwargs)
+            record=record,
+            cls_kwargs=cls_kwargs
+        )
         self.__doc__ = doc
 
-    def _record_type_from_kwargs(self, cls_kwargs):
-        'Get the record type from the given class kwargs'
-        return cls_kwargs.get('record') or cls_kwargs.get('mock_record')
+    @property
+    def record_type(self):
+        """The configured record type to report. [Backward-compatibility]"""
+        return self.pvspec.record
+
+    def __copy__(self):
+        field_spec = copy.deepcopy(self.field_spec)
+        copied = pvproperty.from_pvspec(
+            # pvspec is immutable
+            self.pvspec,
+            # Allow subclasses to override field handlers without affecting
+            # the parent by performing a deep copy here:
+            field_spec=field_spec,
+            doc=self.__doc__,
+        )
+        if copied.field_spec:
+            # Update the reference to the parent property:
+            copied.field_spec.prop = copied
+        return copied
 
     def __get__(self, instance, owner):
         """Descriptor method: get the pvproperty instance from a group."""
@@ -691,6 +954,7 @@ class pvproperty:
         """
         Usually used as a decorator, this sets the ``getter`` in the PVSpec.
         """
+        check_signature('get', get, expect_method=True)
         self.pvspec = self.pvspec._replace(get=get)
         return self
 
@@ -698,6 +962,7 @@ class pvproperty:
         """
         Usually used as a decorator, this sets the ``putter`` in the PVSpec.
         """
+        check_signature('put', put, expect_method=True)
         self.pvspec = self.pvspec._replace(put=put)
         return self
 
@@ -705,6 +970,7 @@ class pvproperty:
         """
         Usually used as a decorator, this sets ``startup`` in the PVSpec.
         """
+        check_signature('startup', startup, expect_method=True)
         self.pvspec = self.pvspec._replace(startup=startup)
         return self
 
@@ -712,6 +978,7 @@ class pvproperty:
         """
         Usually used as a decorator, this sets ``shutdown`` in the PVSpec.
         """
+        check_signature('shutdown', shutdown, expect_method=True)
         self.pvspec = self.pvspec._replace(shutdown=shutdown)
         return self
 
@@ -734,7 +1001,7 @@ class pvproperty:
             Fail (and stop scanning) when unhandled exceptions occur
         use_scan_field : bool, optional
             Use the .SCAN field if this pvproperty is a mocked record.  Raises
-            ValueError if mock_record is not used.
+            ValueError if ``record`` is not used.
 
         Returns
         -------
@@ -743,68 +1010,29 @@ class pvproperty:
             pvproperty startup function signature:
                 (group, instance, async_library)
         """
-        # TODO: maybe allow rate to be tied to a PV (e.g., a SCAN field?)
-        def wrapper(scan_function):
-            async def call_scan_function(group, prop, async_lib):
-                try:
-                    await scan_function(group, prop, async_lib)
-                except Exception:
-                    prop.log.exception('Scan exception')
-                    await prop.alarm.write(status=AlarmStatus.SCAN,
-                                           severity=failure_severity,
-                                           )
-                    if stop_on_error:
-                        raise
-                else:
-                    if ((prop.alarm.severity, prop.alarm.status) ==
-                            (failure_severity, AlarmStatus.SCAN)):
-                        await prop.alarm.write(
-                            status=AlarmStatus.NO_ALARM,
-                            severity=AlarmSeverity.NO_ALARM,
-                        )
-
-            async def scanned_startup(group, prop, async_lib):
-                if use_scan_field and period is not None:
-                    if prop.field_inst.scan_rate_sec is None:
-                        # This is a hook to allow setting of the default scan
-                        # rate through the 'period' argument of the decorator.
-                        prop.field_inst._scan_rate_sec = period
-                        # TODO: update .SCAN to reflect this number
-
-                sleep = async_lib.library.sleep
-                while True:
-                    t0 = time.monotonic()
-                    if use_scan_field:
-                        iter_time = prop.field_inst.scan_rate_sec
-                        if iter_time is None:
-                            iter_time = 0
-                    else:
-                        iter_time = period
-
-                    if iter_time > 0:
-                        await call_scan_function(group, prop, async_lib)
-                    else:
-                        iter_time = 0.1
-                        # TODO: could the scan rate - or values in general -
-                        # have events tied with them so busy loops are
-                        # unnecessary?
-                    elapsed = time.monotonic() - t0
-                    sleep_time = (max(0, iter_time - elapsed)
-                                  if subtract_elapsed
-                                  else iter_time)
-                    await sleep(sleep_time)
-            return self.startup(scanned_startup)
+        def wrapper(func):
+            check_signature('scan', func, expect_method=True)
+            wrapped = scan_wrapper(
+                func, period,
+                subtract_elapsed=subtract_elapsed,
+                stop_on_error=stop_on_error,
+                failure_severity=failure_severity,
+                use_scan_field=use_scan_field,
+            )
+            self.pvspec = self.pvspec._replace(scan=wrapped)
+            return self
 
         if use_scan_field:
             if not self.record_type:
-                raise CaprotoValueError('Must use mock_record in conjunction with '
-                                        'use_scan_field')
+                raise CaprotoValueError(
+                    '`use_scan_field=True` requires `record="..."` to be set'
+                )
         elif period <= 0:
             raise CaprotoValueError('Scan period must be > 0')
 
         return wrapper
 
-    def __call__(self, get, put=None, startup=None, shutdown=None):
+    def __call__(self, get, put=None, startup=None, shutdown=None, scan=None):
         # handles case where pvproperty(**spec_kw)(getter, putter, startup) is
         # used
         pvspec = self.pvspec
@@ -813,7 +1041,9 @@ class pvproperty:
                        value=pvspec.value,
                        alarm_group=pvspec.alarm_group,
                        doc=pvspec.doc,
-                       cls_kwargs=pvspec.cls_kwargs)
+                       scan=scan,
+                       cls_kwargs=pvspec.cls_kwargs,
+                       )
 
         if get.__doc__:
             if self.__doc__ is None:
@@ -825,8 +1055,19 @@ class pvproperty:
         return self
 
     @classmethod
-    def from_pvspec(cls, pvspec):
-        prop = cls()
+    def from_pvspec(cls, pvspec, **kwargs):
+        """
+        Create a pvproperty from a PVSpec instance.
+
+        Parameters
+        ----------
+        pvspec : PVSpec
+            PVSpec instance for the new pvproperty.
+
+        **kwargs :
+            Keyword arguments are passed onto the pvproperty instance.
+        """
+        prop = cls(**kwargs)
         prop.pvspec = pvspec
         return prop
 
@@ -864,6 +1105,10 @@ class NestedPvproperty(pvproperty):
 
     def shutdown(self, shutdown):
         super().shutdown(shutdown)
+        return self.parent
+
+    def scan(self, scan):
+        super().scan(scan)
         return self.parent
 
     @classmethod
@@ -1028,6 +1273,9 @@ def get_pv_pair_wrapper(setpoint_suffix='', readback_suffix='_RBV'):
     If no put method is defined for the setter, a default will be specified
     which updates the readback value on write.
 
+    Startup, shutdown, and scan hooks will be configured on the readback
+    instance.
+
     Parameters
     ----------
     setpoint_suffix : str, optional
@@ -1046,16 +1294,17 @@ def get_pv_pair_wrapper(setpoint_suffix='', readback_suffix='_RBV'):
 
     def wrapped(*, get=None, put=None, startup=None, shutdown=None, name=None,
                 dtype=None, value=None, max_length=None, alarm_group=None,
-                doc=None, fields=None, setpoint_kw=None, readback_kw=None,
+                doc=None, fields=None, scan=None, setpoint_kw=None,
+                readback_kw=None,
                 **cls_kwargs):
         if cls_kwargs.pop('read_only', None) not in (None, False):
             raise RuntimeError('Read-only settings for a setpoint/readback '
                                'pair should not be specified')
 
         pvspec_kwargs = dict(
-            startup=startup, shutdown=shutdown, dtype=dtype, value=value,
-            max_length=max_length, alarm_group=alarm_group, doc=doc,
-            fields=fields
+            dtype=dtype, value=value, max_length=max_length,
+            alarm_group=alarm_group, doc=doc, fields=fields,
+            record=None,
         )
 
         if put is None:
@@ -1082,6 +1331,7 @@ def get_pv_pair_wrapper(setpoint_suffix='', readback_suffix='_RBV'):
         readback = get_kwargs(
             readback_kw,
             name=readback_suffix, get=get, read_only=True,
+            scan=scan, startup=startup, shutdown=shutdown,
             cls_kwargs=dict(cls_kwargs),
             **pvspec_kwargs
         )
@@ -1311,33 +1561,32 @@ class PVGroupMeta(type):
                 for subattr, subgroup in subgroup_cls._subgroups_.items():
                     subgroups['.'.join((attr, subattr))] = subgroup
 
-        for attr, prop in metacls.find_pvproperties(dct):
-            pvspec = prop.pvspec
-            module_logger.debug('class %s pvproperty attr %s: %r', name, attr,
-                                pvspec)
-            pvs[attr] = prop
-
-            if pvspec.cls_kwargs:
-                # Ensure all passed class kwargs are valid for the specific
-                # class, so it doesn't bite us on instantiation
-
-                prop_cls = data_class_from_pvspec(group=cls, pvspec=pvspec)
-                if not hasattr(prop_cls, '_valid_init_kw'):
-                    # TODO this should be generated elsewhere
-                    prop_cls._valid_init_kw = {
-                        key
-                        for cls in inspect.getmro(prop_cls)
-                        for key in inspect.signature(cls).parameters.keys()
-                    }
-
-                bad_kw = set(pvspec.cls_kwargs) - prop_cls._valid_init_kw
-                if bad_kw:
-                    raise CaprotoValueError(
-                        f'{cls.__name__}.{attr}: Bad kw for class {prop_cls}: '
-                        f'{bad_kw}'
-                    )
-
+        pvs.update(metacls.find_pvproperties(dct))
         return cls
+
+
+pvspec_type_map = {
+    str: PvpropertyChar,
+    bytes: PvpropertyByte,
+    int: PvpropertyInteger,
+    float: PvpropertyDouble,
+    bool: PvpropertyBoolEnum,
+    enum.IntEnum: PvpropertyEnum,
+
+    ChannelType.STRING: PvpropertyString,
+    ChannelType.INT: PvpropertyShort,
+    ChannelType.LONG: PvpropertyInteger,
+    ChannelType.DOUBLE: PvpropertyDouble,
+    ChannelType.FLOAT: PvpropertyFloat,
+    ChannelType.ENUM: PvpropertyEnum,
+    ChannelType.CHAR: PvpropertyChar,
+}
+
+# Auto-generate the read-only class specification:
+pvspec_type_map_read_only = {
+    dtype: globals()[f'{cls.__name__}RO']
+    for dtype, cls in pvspec_type_map.items()
+}
 
 
 def data_class_from_pvspec(group, pvspec):
@@ -1356,21 +1605,9 @@ def data_class_from_pvspec(group, pvspec):
 
 def channeldata_from_pvspec(group, pvspec):
     'Create a ChannelData instance based on a PVSpec'
-    full_pvname = group.prefix + expand_macros(pvspec.name, group.macros)
-    value = (pvspec.value
-             if pvspec.value is not None
-             else group.default_values[pvspec.dtype]
-             )
-
-    cls = data_class_from_pvspec(group, pvspec)
-    kw = dict(pvspec.cls_kwargs) if pvspec.cls_kwargs is not None else {}
-
-    inst = cls(group=group, pvspec=pvspec, value=value,
-               max_length=pvspec.max_length,
-               alarm=group.alarms[pvspec.alarm_group], pvname=full_pvname,
-               **kw)
-    inst.__doc__ = pvspec.doc
-    return (full_pvname, inst)
+    # Back-compat for now
+    instance = pvspec.create(group)
+    return instance.pvname, instance
 
 
 class PVGroup(metaclass=PVGroupMeta):
@@ -1392,28 +1629,8 @@ class PVGroup(metaclass=PVGroupMeta):
         https://epics.anl.gov/base/R3-15/5-docs/filters.html
     """
 
-    type_map = {
-        str: PvpropertyChar,
-        bytes: PvpropertyByte,
-        int: PvpropertyInteger,
-        float: PvpropertyDouble,
-        bool: PvpropertyBoolEnum,
-        enum.IntEnum: PvpropertyEnum,
-
-        ChannelType.STRING: PvpropertyString,
-        ChannelType.INT: PvpropertyShort,
-        ChannelType.LONG: PvpropertyInteger,
-        ChannelType.DOUBLE: PvpropertyDouble,
-        ChannelType.FLOAT: PvpropertyFloat,
-        ChannelType.ENUM: PvpropertyEnum,
-        ChannelType.CHAR: PvpropertyChar,
-    }
-
-    # Auto-generate the read-only class specification:
-    type_map_read_only = {
-        dtype: globals()[f'{cls.__name__}RO']
-        for dtype, cls in type_map.items()
-    }
+    type_map = dict(pvspec_type_map)
+    type_map_read_only = dict(pvspec_type_map_read_only)
 
     default_values = {
         str: '',
@@ -1523,9 +1740,8 @@ class PVGroup(metaclass=PVGroupMeta):
                 channeldata = group.attr_pvdb[sub_attr]
                 pvname = group.attr_to_pvname[sub_attr]
             else:
-                group = self
-                pvname, channeldata = channeldata_from_pvspec(group,
-                                                              pvprop.pvspec)
+                channeldata = pvprop.pvspec.create(self)
+                pvname = channeldata.pvname
 
             if pvname in self.pvdb:
                 first_seen = self.pvdb[pvname]
@@ -1690,3 +1906,36 @@ def ioc_arg_parser(*, desc, default_prefix, argv=None, macros=None,
                                              argv=argv, macros=macros,
                                              supported_async_libs=supported_async_libs)
     return split_args(parser.parse_args())
+
+
+def run(pvdb, *,
+        module_name="caproto.asyncio.server",
+        interfaces=None,
+        log_pv_names=False,
+        startup_hook=None):
+    """
+    Run an IOC, given its PV database dictionary and async-library module name.
+
+    Parameters
+    ----------
+    pvdb : dict
+        The PV database dictionary.
+
+    module_name : str, optional
+        The async library module name.  Defaults to using asyncio.
+
+    interfaces : list, optional
+        List of interfaces to listen on.
+
+    log_pv_names : bool, optional
+        Log PV names at startup.
+
+    startup_hook : coroutine, optional
+        Hook to call at startup with the ``async_lib`` shim.
+    """
+    from importlib import import_module  # to avoid leaking into module ns
+    module = import_module(module_name)
+    run = module.run
+    return run(
+        pvdb, interfaces=interfaces, log_pv_names=log_pv_names,
+        startup_hook=startup_hook)

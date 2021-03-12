@@ -28,7 +28,7 @@ from ..client import common
 from ..client.search_results import (DuplicateSearchResponse, SearchResults,
                                      UnknownSearchResponse)
 from .utils import (AsyncioQueue, _CallbackExecutor, _DatagramProtocol,
-                    _StreamProtocol, _TaskHandler, _TransportWrapper,
+                    _TaskHandler, _TransportWrapper, _UdpTransportWrapper,
                     get_running_loop)
 
 ch_logger = logging.getLogger('caproto.ch')
@@ -55,7 +55,6 @@ class SharedBroadcaster:
 
         self.broadcaster = ca.Broadcaster(our_role=ca.CLIENT)
         self.log = self.broadcaster.log
-        self.protocol = None
         self.wrapped_transport = None
 
         self.command_queue = AsyncioQueue()
@@ -135,6 +134,12 @@ class SharedBroadcaster:
         await self._tasks.cancel_all(wait=True)
         self.log.debug('Broadcaster: Closing the UDP socket')
         self.udp_sock = None
+        try:
+            if self.protocol is not None:
+                if self.protocol.transport is not None:
+                    self.protocol.transport.close()
+        except OSError:
+            self.log.exception('Broadcaster transport close error')
 
         self.log.debug('Broadcaster disconnect complete')
 
@@ -157,18 +162,20 @@ class SharedBroadcaster:
         self.udp_sock = ca.bcast_socket(socket_module=socket)
 
         loop = get_running_loop()
+        # Must bind or getsocketname() will raise on Windows.
+        # See https://github.com/caproto/caproto/issues/514.
+        self.udp_sock.bind(('', 0))
+
         transport, self.protocol = await loop.create_datagram_endpoint(
             functools.partial(_DatagramProtocol, parent=self,
-                              recv_func=self.receive_queue.put),
+                              identifier='client-search',
+                              queue=self.receive_queue),
             sock=self.udp_sock)
 
         # TODO: wrapped transport is a server concept for unifying
         # trio/asyncio/curio
-        self.wrapped_transport = _TransportWrapper(transport)
+        self.wrapped_transport = _UdpTransportWrapper(transport)
 
-        # Must bind or getsocketname() will raise on Windows.
-        # See https://github.com/caproto/caproto/issues/514.
-        self.udp_sock.bind(('', 0))
         self.broadcaster.client_address = safe_getsockname(self.udp_sock)
 
     async def register(self):
@@ -207,7 +214,12 @@ class SharedBroadcaster:
         'Loop which consumes receive_queue datagrams from _DatagramProtocol.'
         queues = collections.defaultdict(list)
         while True:
-            bytes_received, address = await self.receive_queue.async_get()
+            _, bytes_received, address = await self.receive_queue.async_get()
+            if isinstance(bytes_received, Exception):
+                self.log.exception('Broadcaster receive exception',
+                                   exc_info=bytes_received)
+                continue
+
             try:
                 commands = self.broadcaster.recv(bytes_received, address)
             except ca.RemoteProtocolError:
@@ -234,7 +246,6 @@ class SharedBroadcaster:
                     queue.put((address, names))
             except Exception:
                 self.log.exception('Broadcaster receive loop evaluation')
-                continue
 
     def _process_command(self, addr, command, queues):
         # if isinstance(command, ca.RepeaterConfirmResponse):
@@ -860,6 +871,64 @@ class Context:
 
         self.log.debug('Context search-results processing thread has exited.')
 
+    async def monitor(self, *pv_names, context=None, data_type='time'):
+        """
+        Monitor pv_names asynchronously, yielding events as they happen.
+
+        Parameters
+        ----------
+        *pv_names : str
+            PV names to monitor.
+
+        data_type : {'time', 'control', 'native'}
+            The subscription type.
+
+        Yields
+        -------
+        event : {'subscription', 'connection'}
+            The event type.
+
+        context : str or Subscription
+            For a 'connection' event, this is the PV name.  For a 'subscription'
+            event, this is the `Subscription` instance.
+
+        data : str or EventAddResponse
+            For a 'subscription' event, the `EventAddResponse` holds the data and
+            timestamp.  For a 'connection' event, this is one of ``{'connected',
+            'disconnected'}``.
+        """
+        queue = AsyncioQueue()
+
+        def value_update(sub, event_add_response):
+            queue.put(('subscription', sub, event_add_response))
+
+        def connection_state_callback(pv, state):
+            queue.put(('connection', pv, state))
+
+        channels = await self.get_pvs(
+            *pv_names, connection_state_callback=connection_state_callback
+        )
+        subscriptions = []
+
+        for channel in channels:
+            sub = channel.subscribe(data_type=data_type)
+            token = sub.add_callback(value_update)
+            subscriptions.append(
+                dict(
+                    channel=channel,
+                    sub=sub,
+                    token=token,
+                )
+            )
+
+        try:
+            while True:
+                event, context, data = await queue.async_get()
+                yield event, context, data
+        finally:
+            for info in subscriptions.values():
+                await info['sub'].remove_callback(info['token'])
+
 
 class VirtualCircuitManager:
     """
@@ -870,7 +939,8 @@ class VirtualCircuitManager:
     # this is rarely necessary.
     # """
 
-    def __init__(self, context, circuit, timeout=common.TIMEOUT):
+    def __init__(self, context, circuit,
+                 timeout=common.GLOBAL_DEFAULT_TIMEOUT):
         self.context = context
         self.circuit = circuit  # a caproto.VirtualCircuit
         self.log = circuit.log
@@ -878,8 +948,7 @@ class VirtualCircuitManager:
         self.pvs = {}  # map cid to PV
         self.ioids = {}  # map ioid to Channel and info dict
         self.subscriptions = {}  # map subscriptionid to Subscription
-        self.socket = None
-        self._connection_made = asyncio.Event()
+        self.transport = None
         self._ioid_counter = ThreadsafeCounter()
         self._raw_lock = asyncio.Lock()
         self._ready = asyncio.Event()
@@ -905,36 +974,44 @@ class VirtualCircuitManager:
         self._tasks.create(self._connection_ready_hook())
         self._tasks.create(self._connect(timeout=timeout))
 
+    async def _transport_receive_loop(self, transport):
+        while True:
+            try:
+                bytes_received = await transport.recv()
+            except ca.CaprotoNetworkError:
+                bytes_received = b''
+
+            self.last_tcp_receipt = time.monotonic()
+            commands, _ = self.circuit.recv(bytes_received)
+            for c in commands:
+                self.command_queue.put(c)
+
+            if not bytes_received:
+                break
+
     async def _connect(self, timeout):
         """Start the connection and spawn tasks."""
-        self.transport, self.protocol = await get_running_loop().create_connection(
-            functools.partial(_StreamProtocol, parent=self,
-                              connection_callback=self._circuit_connection_change,
-                              recv_func=self._circuit_bytes_received),
-            host=self.circuit.address[0],
-            port=self.circuit.address[1],
-        )
-
         try:
-            await asyncio.wait_for(self._connection_made.wait(),
-                                   timeout=timeout)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(*self.circuit.address),
+                timeout=timeout,
+            )
         except asyncio.TimeoutError:
             host, port = self.circuit.address
             raise ca.CaprotoTimeoutError(
-                f"Circuit with server at {host}:{port} "
-                f"did not connect within "
-                f"{float(timeout):.3}-second timeout.")
+                f"Circuit with server at {host}:{port} did not connect within "
+                f"{float(timeout):.3}-second timeout."
+            )
 
-        self.socket = self.transport.get_extra_info('socket')
-        assert self.socket is not None
+        self.transport = _TransportWrapper(reader, writer)
+        self._tasks.create(self._transport_receive_loop(self.transport))
 
         # this is done by default from 3.6+
-        # sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self.transport.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         # This is required because of `sock_sendall`
-        self.socket.setblocking(False)
+        self.transport.sock.setblocking(False)
 
-        self.circuit.our_address = safe_getsockname(self.socket)
+        self.circuit.our_address = self.transport.getsockname()
 
         # This dict is passed to the loggers.
         self._tags = {'their_address': self.circuit.address,
@@ -971,22 +1048,6 @@ class VirtualCircuitManager:
                 f"Circuit with server at {host}:{port} did not connect within "
                 f"{float(timeout):.3}-second timeout.") from None
 
-    def _circuit_bytes_received(self, bytes_received):
-        self.last_tcp_receipt = time.monotonic()
-
-        commands, _ = self.circuit.recv(bytes_received)
-        for c in commands:
-            self.command_queue.put(c)
-
-    def _circuit_connection_change(self, connected, info):
-        self.log.debug('Circuit connection status change: %s %s',
-                       (connected and 'connected') or 'disconnected',
-                       info or '')
-        if connected:
-            self._connection_made.set()
-        else:
-            self.command_queue.put(ca.DISCONNECTED)
-
     @property
     def server_protocol_version(self):
         return self.context.broadcaster.server_protocol_versions[
@@ -1015,7 +1076,7 @@ class VirtualCircuitManager:
         if self.dead.is_set():
             raise common.DeadCircuitError()
 
-        if self.socket is None:
+        if self.transport is None:
             self._send_on_connection.append((commands, extra))
             return
 
@@ -1028,14 +1089,12 @@ class VirtualCircuitManager:
         async def _socket_send(buffers_to_send):
             'Send a list of buffers over the socket'
             try:
-                return self.socket.sendmsg(buffers_to_send)
+                return self.transport.sock.sendmsg(buffers_to_send)
             except BlockingIOError:
                 raise ca.SendAllRetry()
 
         async with self._raw_lock:
             await ca.async_send_all(buffers_to_send, _socket_send)
-        # await get_running_loop().sock_sendall(
-        #     self.socket, b''.join(buffers_to_send))
 
     async def events_off(self):
         """
@@ -1216,19 +1275,15 @@ class VirtualCircuitManager:
         # to create a fresh VirtualCiruit and VirtualCircuitManager.
         self.context.circuit_managers.pop(self.circuit.address, None)
 
-        # Clean up the socket if it has not yet been cleared:
-        async def shutdown_old_socket(sock):
+        if self.transport is not None:
             try:
-                sock.shutdown(socket.SHUT_WR)
+                self.transport.close()
             except OSError:
-                pass
-
-            sock.close()
-
-        sock, self.socket = self.socket, None
-
-        if sock is not None:
-            self._tasks.create(shutdown_old_socket(sock))
+                self.log.exception(
+                    'VirtualCircuitManager transport close error'
+                )
+            finally:
+                self.transport = None
 
         tags = {'their_address': self.circuit.address}
         if reconnect:
@@ -1244,16 +1299,17 @@ class VirtualCircuitManager:
         else:
             self.log.debug('Not attempting reconnection', extra=tags)
 
-        self.log.debug("Shutting down ThreadPoolExecutor for user callbacks",
-                       extra=tags)
-        await self.user_callback_executor.shutdown()
-
     async def disconnect(self):
         await self._disconnected()
-        if self.socket is None:
+        if self.transport is None:
             return
 
         self.log.debug('Circuit manager disconnected by user')
+
+        tags = {'their_address': self.circuit.address}
+        self.log.debug("Shutting down ThreadPoolExecutor for user callbacks",
+                       extra=tags)
+        await self.user_callback_executor.shutdown()
 
 
 def ensure_connected(func):

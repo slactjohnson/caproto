@@ -11,6 +11,7 @@ from caproto import (CaprotoKeyError, CaprotoNetworkError, CaprotoRuntimeError,
                      ChannelType, RemoteProtocolError, apply_arr_filter,
                      get_environment_variables)
 
+from .._constants import MAX_UDP_RECV
 from .._dbr import SubscriptionType, _LongStringChannelType
 
 # ** Tuning this parameters will affect the servers' performance **
@@ -149,8 +150,13 @@ class VirtualCircuit:
         if self.connected:
             buffers_to_send = self.circuit.send(*commands)
             # send bytes over the wire using some caproto utilities
-            async with self._raw_lock:
-                await ca.async_send_all(buffers_to_send, self.client.sendmsg)
+            try:
+                async with self._raw_lock:
+                    await ca.async_send_all(buffers_to_send, self.client.sendmsg)
+            except (OSError, CaprotoNetworkError) as ex:
+                raise DisconnectedCircuit(
+                    f"Circuit disconnected: {ex}"
+                ) from ex
 
     async def recv(self):
         """
@@ -732,7 +738,9 @@ class Context:
     async def _core_broadcaster_loop(self, udp_sock):
         while True:
             try:
-                bytes_received, address = await udp_sock.recvfrom(4096 * 16)
+                bytes_received, address = await udp_sock.recvfrom(
+                    MAX_UDP_RECV
+                )
             except OSError:
                 self.log.exception('UDP server recvfrom error')
                 await self.async_layer.library.sleep(0.1)
@@ -743,8 +751,8 @@ class Context:
     async def _broadcaster_recv_datagram(self, bytes_received, address):
         try:
             commands = self.broadcaster.recv(bytes_received, address)
-        except RemoteProtocolError:
-            self.log.exception('Broadcaster received bad packet')
+        except RemoteProtocolError as ex:
+            self.log.debug('_broadcaster_recv_datagram: %s', ex, exc_info=ex)
         else:
             await self.command_bundle_queue.put((address, commands))
 
@@ -767,7 +775,6 @@ class Context:
             except Exception as ex:
                 self.log.exception('Broadcaster command queue evaluation failed',
                                    exc_info=ex)
-                continue
 
     def __iter__(self):
         # Implemented to support __getitem__ below
@@ -1030,21 +1037,24 @@ class Context:
         '''Notification from circuit that its connection has closed'''
         self.circuits.discard(circuit)
 
+    def _find_hook_methods(self, *attrs):
+        """Return a dictionary of (not-None) methods given attribute names."""
+        return {
+            f"{name}.{attr}": getattr(instance, attr)
+            for attr in attrs
+            for name, instance in self.pvdb_with_fields.items()
+            if getattr(instance, attr, None) is not None
+        }
+
     @property
     def startup_methods(self):
         'Notify all ChannelData instances of the server startup'
-        return {name: instance.server_startup
-                for name, instance in self.pvdb_with_fields.items()
-                if hasattr(instance, 'server_startup') and
-                instance.server_startup is not None}
+        return self._find_hook_methods("server_startup", "server_scan")
 
     @property
     def shutdown_methods(self):
         'Notify all ChannelData instances of the server shutdown'
-        return {name: instance.server_shutdown
-                for name, instance in self.pvdb.items()
-                if hasattr(instance, 'server_shutdown') and
-                instance.server_shutdown is not None}
+        return self._find_hook_methods("server_shutdown")
 
     async def _bind_tcp_sockets_with_consistent_port_number(self, make_socket):
         # Find a random port number that is free on all self.interfaces,

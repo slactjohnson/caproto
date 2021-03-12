@@ -9,7 +9,11 @@ logger = logging.getLogger('caproto')
 
 class ScanRateIOC(PVGroup):
     # This pvproperty mocks an analog input (ai) record.
-    scanned = pvproperty(value=[0.0], record='ai')
+    scanned = pvproperty(
+        value=0.0,
+        record='ai',
+        doc="An analog input with customizable scan rate."
+    )
 
     # The mocked record also happens to have the standard fields normally
     # associated with an EPICS record.  This is used here to tie in the
@@ -29,6 +33,12 @@ class ScanRateIOC(PVGroup):
     # to the `write` call above.  The timestamps shown by camonitor should be
     # close to this value, but not exact. To compare these, you can also try:
     #    $ camonitor -tsi periodic:scanned
+
+    # As of caproto v0.7.2, you may also include a "startup" method along
+    # with a "scan" method:
+    @scanned.startup
+    async def scanned(self, instance, async_lib):
+        print(f"{instance.name} startup called.")
 
 
 if __name__ == '__main__':

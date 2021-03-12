@@ -19,47 +19,46 @@
 # ``next_command`` method of a :class:`Broadcaster` or a
 # :class:`VirtualCircuit`.
 import array
-from collections.abc import Iterable
 import ctypes
-import _ctypes
 import inspect
 import os
-import struct
 import socket
+import struct
 import warnings
-from ._headers import (MessageHeader, ExtendedMessageHeader,
-                       AccessRightsResponseHeader, ClearChannelRequestHeader,
-                       ClearChannelResponseHeader, ClientNameRequestHeader,
-                       CreateChFailResponseHeader, CreateChanRequestHeader,
-                       CreateChanResponseHeader, EchoRequestHeader,
-                       EchoResponseHeader, ErrorResponseHeader,
-                       EventAddRequestHeader, EventAddResponseHeader,
-                       EventCancelRequestHeader, EventCancelResponseHeader,
-                       EventsOffRequestHeader, EventsOnRequestHeader,
-                       HostNameRequestHeader, NotFoundResponseHeader,
-                       ReadNotifyRequestHeader, ReadNotifyResponseHeader,
-                       ReadRequestHeader, ReadResponseHeader,
-                       ReadSyncRequestHeader,
-                       RepeaterConfirmResponseHeader,
-                       RepeaterRegisterRequestHeader, BeaconHeader,
-                       SearchRequestHeader, SearchResponseHeader,
-                       ServerDisconnResponseHeader, VersionRequestHeader,
-                       VersionResponseHeader, WriteNotifyRequestHeader,
-                       WriteNotifyResponseHeader, WriteRequestHeader,
-                       )
+from collections.abc import Iterable
 
-from ._constants import (DO_REPLY, NO_REPLY, MAX_RECORD_LENGTH)
-from ._dbr import (DBR_INT, DBR_TYPES, ChannelType, float_t, short_t, ushort_t,
-                   native_type, special_types, MAX_STRING_SIZE, AccessRights)
+import _ctypes
 
 from . import _dbr as dbr
 from ._backend import backend
+from ._constants import DO_REPLY, MAX_RECORD_LENGTH, NO_REPLY
+from ._dbr import (DBR_INT, DBR_TYPES, MAX_STRING_SIZE, AccessRights,
+                   ChannelType, float_t, native_type, short_t, special_types,
+                   ushort_t)
+from ._headers import (AccessRightsResponseHeader, BeaconHeader,
+                       ClearChannelRequestHeader, ClearChannelResponseHeader,
+                       ClientNameRequestHeader, CreateChanRequestHeader,
+                       CreateChanResponseHeader, CreateChFailResponseHeader,
+                       EchoRequestHeader, EchoResponseHeader,
+                       ErrorResponseHeader, EventAddRequestHeader,
+                       EventAddResponseHeader, EventCancelRequestHeader,
+                       EventCancelResponseHeader, EventsOffRequestHeader,
+                       EventsOnRequestHeader, ExtendedMessageHeader,
+                       HostNameRequestHeader, MessageHeader,
+                       NotFoundResponseHeader, ReadNotifyRequestHeader,
+                       ReadNotifyResponseHeader, ReadRequestHeader,
+                       ReadResponseHeader, ReadSyncRequestHeader,
+                       RepeaterConfirmResponseHeader,
+                       RepeaterRegisterRequestHeader, SearchRequestHeader,
+                       SearchResponseHeader, ServerDisconnResponseHeader,
+                       VersionRequestHeader, VersionResponseHeader,
+                       WriteNotifyRequestHeader, WriteNotifyResponseHeader,
+                       WriteRequestHeader)
 from ._status import eca_value_to_status, ensure_eca_value
 from ._utils import (CLIENT, NEED_DATA, REQUEST, RESPONSE, SERVER,
-                     CaprotoTypeError, CaprotoValueError,
-                     CaprotoNotImplementedError, ValidationError,
+                     CaprotoNotImplementedError, CaprotoTypeError,
+                     CaprotoValueError, RemoteProtocolError, ValidationError,
                      ensure_bytes)
-
 
 __all__ = ('AccessRightsResponse', 'ClearChannelRequest',
            'ClearChannelResponse', 'ClientNameRequest',
@@ -239,7 +238,7 @@ def data_payload(data, metadata, data_type, data_count):
         the input is big-endian. (We have no means of checking.) If the input
         is ``numpy.ndarray`` or any other iterable, we ensure big-endianness.
     metadata : a DBR struct, any iterable, or bytes
-    data_type : integer
+    data_type : ChannelType or integer
     data_count : integer
 
     Returns
@@ -247,6 +246,7 @@ def data_payload(data, metadata, data_type, data_count):
     size, md_payload, data_payload[, pad_payload]
         pad_payload will only be returned if needed
     """
+    data_type = ChannelType(data_type)
 
     # Make the data payload.
     if isinstance(data, bytes):
@@ -266,8 +266,7 @@ def data_payload(data, metadata, data_type, data_count):
     size, pad_payload = pad_buffers(md_payload, data_payload)
     if pad_payload:
         return size, md_payload, data_payload, pad_payload
-    else:
-        return size, md_payload, data_payload
+    return size, md_payload, data_payload
 
 
 def extract_data(buffer, data_type, data_count):
@@ -298,7 +297,13 @@ def read_datagram(data, address, role):
     while barray:
         header = MessageHeader.from_buffer(barray)
         barray = barray[_MessageHeaderSize:]
-        _class = Commands[role][header.command]
+        try:
+            _class = Commands[role][header.command]
+        except KeyError:
+            raise RemoteProtocolError(
+                f"Packet with bad command ID {hex(header.command)} was "
+                f"received. Header: {header}"
+            ) from None
         payload_size = header.payload_size
         if _class.HAS_PAYLOAD:
             payload_bytes = barray[:header.payload_size]
@@ -365,7 +370,17 @@ def read_from_bytestream(data, role):
     if num_bytes_needed > 0:
         return data, NEED_DATA, num_bytes_needed
 
-    _class = Commands[role][header.command]
+    try:
+        _class = Commands[role][header.command]
+    except KeyError:
+        raise RemoteProtocolError(
+            f"Packet with bad command ID {hex(header.command)} was received."
+            f"\nThis may be a non-Channel Access client such as a security "
+            f"scanner attempting to probe a server, a malfunctioning client, "
+            f"or an unsupported client. If the above does not apply, please "
+            f"open an issue: https://github.com/caproto/caproto/issues"
+            f"\nHeader details: {header}."
+        ) from None
 
     header_size = ctypes.sizeof(header)
     total_size = header_size + header.payload_size
@@ -914,8 +929,9 @@ class EventAddRequest(Message):
 
     def __init__(self, data_type, data_count, sid, subscriptionid, low,
                  high, to, mask):
-        header = EventAddRequestHeader(data_type, data_count, sid,
-                                       subscriptionid)
+        header = EventAddRequestHeader(
+            ChannelType(data_type), data_count, sid, subscriptionid
+        )
         payload = EventAddRequestPayload(low=low, high=high, to=to, mask=mask)
         super().__init__(header, payload)
 
@@ -978,7 +994,9 @@ class EventAddResponse(Message):
 
     def __init__(self, data, data_type, data_count,
                  status, subscriptionid, *, metadata=None):
-        size, *buffers = data_payload(data, metadata, data_type, data_count)
+        size, *buffers = data_payload(
+            data, metadata, ChannelType(data_type), data_count
+        )
         status = ensure_eca_value(status)
         header = EventAddResponseHeader(size, data_type, data_count,
                                         status, subscriptionid)
@@ -1040,7 +1058,9 @@ class EventCancelRequest(Message):
     HAS_PAYLOAD = False
 
     def __init__(self, data_type, sid, subscriptionid):
-        header = EventCancelRequestHeader(data_type, 0, sid, subscriptionid)
+        header = EventCancelRequestHeader(
+            ChannelType(data_type), 0, sid, subscriptionid
+        )
         super().__init__(header)
 
     data_type = property(lambda self: ChannelType(self.header.data_type))
@@ -1072,8 +1092,9 @@ class EventCancelResponse(Message):
     HAS_PAYLOAD = False
 
     def __init__(self, data_type, sid, subscriptionid, data_count):
-        header = EventCancelResponseHeader(data_type, data_count, sid,
-                                           subscriptionid)
+        header = EventCancelResponseHeader(
+            ChannelType(data_type), data_count, sid, subscriptionid
+        )
         super().__init__(header)
 
     data_type = property(lambda self: ChannelType(self.header.data_type))
@@ -1101,7 +1122,7 @@ class ReadRequest(Message):
     HAS_PAYLOAD = False
 
     def __init__(self, data_type, data_count, sid, ioid):
-        header = ReadRequestHeader(data_type, data_count, sid, ioid)
+        header = ReadRequestHeader(ChannelType(data_type), data_count, sid, ioid)
         super().__init__(header, validate=False)
 
     data_type = property(lambda self: ChannelType(self.header.data_type))
@@ -1350,7 +1371,9 @@ class ReadNotifyRequest(Message):
     HAS_PAYLOAD = False
 
     def __init__(self, data_type, data_count, sid, ioid):
-        header = ReadNotifyRequestHeader(data_type, data_count, sid, ioid)
+        header = ReadNotifyRequestHeader(
+            ChannelType(data_type), data_count, sid, ioid
+        )
         super().__init__(header)
 
     data_type = property(lambda self: ChannelType(self.header.data_type))
@@ -1500,7 +1523,9 @@ class CreateChanResponse(Message):
     HAS_PAYLOAD = False
 
     def __init__(self, data_type, data_count, cid, sid):
-        header = CreateChanResponseHeader(data_type, data_count, cid, sid)
+        header = CreateChanResponseHeader(
+            ChannelType(data_type), data_count, cid, sid
+        )
         super().__init__(header)
 
     data_type = property(lambda self: ChannelType(self.header.data_type))
@@ -1599,7 +1624,9 @@ class WriteNotifyResponse(Message):
 
     def __init__(self, data_type, data_count, status, ioid):
         status = ensure_eca_value(status)
-        header = WriteNotifyResponseHeader(data_type, data_count, status, ioid)
+        header = WriteNotifyResponseHeader(
+            ChannelType(data_type), data_count, status, ioid
+        )
         super().__init__(header)
 
     data_type = property(lambda self: ChannelType(self.header.data_type))
